@@ -288,7 +288,6 @@ handle_info(#lock_info{lock = Lock0, where = Node, note = Note} = I, State0) ->
 	    NewState = i_add_lock(State, Lock),
 	    case State#state.notify of
 		[] ->
-                    ?dbg("notify = []~n", []),
 		    {noreply, handle_locks(NewState)};
 		_ ->
 		    {noreply, handle_locks(check_if_done(NewState))}
@@ -468,19 +467,20 @@ handle_locks(#state{locks = Locks, deadlocks = Deadlocks} = State) ->
                 fun(#lock{queue = Q}) ->
                         [E#entry.agent || E <- flatten_queue(Q)]
                 end, Locks) ),
-    ?dbg("~p: InvolvedAgents = ~p~n", [self(), InvolvedAgents]),
     case analyse(InvolvedAgents, State#state.locks) of
 	ok ->
-	    ?dbg("~p: analyse(~p, ~p) -> ok~n", [self(), InvolvedAgents,
-						 Locks]),
 	    %% possible indirect deadlocks
 	    %% inefficient computation, optimizes easily
 	    Tell =
                 [ send_lockinfo(Agent, L)
                   || Agent <- compute_indirects(InvolvedAgents),
-                     L <- Locks,
+                     #lock{queue = [_,_|_]} = L <- Locks,
                      interesting(State, L, Agent) ],
-            ?dbg("~p: Tell = ~p~n", [self(), Tell]),
+            if Tell =/= [] ->
+                    ?dbg("~p: Tell = ~p~n", [self(), Tell]);
+               true ->
+                    ok
+            end,
 	    State;
 	{deadlock,ShouldSurrender,ToObject} ->
 	    ?dbg("~p: deadlock: ShouldSurrender = ~p, ToObject = ~p~n",
@@ -498,7 +498,10 @@ handle_locks(#state{locks = Locks, deadlocks = Deadlocks} = State) ->
                       InvolvedAgents,
                       lists:keyfind(ToObject, #lock.object, Locks)),
                     Sync1 = OldLock ++ State#state.sync,
-                    ?dbg("~p: Sync1 = ~p~n", [self(), Sync1]),
+                    ?dbg("~p: Sync1 = ~p~n"
+                         "Old Locks = ~p~n"
+                         "Old Sync = ~p~n", [self(), Sync1, Locks,
+                                             State#state.sync]),
 		    State#state{locks = NewLocks,
 				sync = Sync1,
 				deadlocks = NewDeadlocks};
@@ -601,9 +604,7 @@ i_add_lock(#state{locks = Locks, sync = Sync} = State,
 
 -spec compute_indirects(#state{}) -> [pid()].
 compute_indirects(InvolvedAgents) ->
-    Is = [ A || A<-InvolvedAgents, A>self()],
-    ?dbg("~p: Indirects = ~p~n", [self(), Is]),
-    Is.
+    [ A || A<-InvolvedAgents, A>self()].
 %% here we impose a global
 %% ordering on pids !!
 %% Alternatively, we send to
@@ -616,16 +617,9 @@ has_a_lock(Locks, Agent) ->
 %% is this lock interesting for the agent?
 %%
 -spec interesting(#state{}, #lock{}, agent()) -> boolean().
-interesting(#state{locks = Locks}, #lock{queue = Q} = Lock, Agent) ->
-    HasALock = has_a_lock(Locks, Agent),
-    ?dbg("~p: HasALock (~p, ~p) -> ~p~n", [self(), Agent, Locks, HasALock]),
-    Member = is_member(Agent, Q),
-    ?dbg("~p: Member (~p, ~p) -> ~p~n", [self(), Agent, Q, Member]),
-    R = (not Member) andalso HasALock,
-
-    ?dbg("~p: Interesting (~p, ~p) = ~p~n",
-         [self(), Lock#lock.object, Agent, R]),
-    R.
+interesting(#state{locks = Locks}, #lock{queue = Q}, Agent) ->
+    (not is_member(Agent, Q)) andalso
+        has_a_lock(Locks, Agent).
 
 is_member(A, [#r{entries = Es}|T]) ->
     lists:keymember(A, #entry.agent, Es) orelse is_member(A, T);
@@ -659,7 +653,6 @@ uniq(L) ->
 analyse(_Agents, Locks) ->
     Nodes =
 	expand_agents([ {hd(L#lock.queue), L#lock.object} || L <- Locks ]),
-    ?dbg("~p: Nodes = ~p~n", [self(), Nodes]),
     Connect =
 	fun({A1, O1}, {A2, _}) ->
 		lists:any(

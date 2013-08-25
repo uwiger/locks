@@ -27,6 +27,7 @@ run_test_() ->
       , ?_test(one_lock_two_clients())
       , ?_test(two_clients_direct_deadlock())
       , ?_test(three_clients_deadlock())
+      , ?_test(two_clients_hierarchical_deadlock())
      ]}.
 
 -define(LA, locks_agent).
@@ -81,6 +82,19 @@ three_clients_deadlock() ->
         fun(normal, {ok, [_|_]}, St) -> St end},
        {3, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
+two_clients_hierarchical_deadlock() ->
+    script(
+      [1,2],
+      [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok, []})},
+       {2, ?LINE, ?LA, lock, ['$agent', [b]], match({ok, []})},
+       {1, ?LINE, ?LA, lock, ['$agent', [b,1]], 100, match(timeout, timeout)},
+       {2, ?LINE, ?LA, lock, ['$agent', [a,1]], 100, match(timeout, timeout)},
+       {1, ?LINE, ?MODULE, client_result, [],
+        fun(normal, {ok, [_|_]}, St) -> St end},
+       {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
+       {2, ?LINE, ?MODULE, client_result, [],
+        fun(normal, {ok, [_|_]}, St) -> St end},
+       {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 script(Agents, S) ->
     AgentPids = [spawn_agent(A) || A <- Agents],

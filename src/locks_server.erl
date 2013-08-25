@@ -108,7 +108,8 @@ handle_info({lock, _, _, _} = Msg, #st{} = S) ->
 handle_info({remove_agent, _} = Msg, S) ->
     handle_cast(Msg, S);
 handle_info({'DOWN', _Ref, process, Pid, _}, #st{tabs = Tabs} = S) ->
-    notify(do_remove_agent(Pid, Tabs), S#st.notify_as),
+    Updated = do_remove_agent(Pid, Tabs),
+    notify(Updated, S#st.notify_as),
     {noreply, demonitor_agent(Pid, S)};
 handle_info(_, S) ->
     {noreply, S}.
@@ -148,32 +149,47 @@ insert(ID, Tid, Mode, {Locks, Tids})
   when is_list(ID), Mode==read; Mode==write ->
     Related = related_locks(ID, Locks),
     NewVsn = new_vsn(Related),
-    Result = insert_agent(Related, ID, Tid, Mode, NewVsn),
-    ets:insert(Tids, {Tid,ID}),
+    {Check, Result} = insert_agent(Related, ID, Tid, Mode, NewVsn),
+    ets:insert(Tids, [{Tid,ID1} || #lock{object = ID1} <- Result]),
+    check_tids(Check, ID, Tid, Result, Tids),
     ets:insert(Locks, Result),
     Result.
 
-do_surrender(ID, Tid, {Locks, _Tids}) ->
-    case ets:lookup(Locks, ID) of
-	[#lock{version = V, queue = Q} = L] ->
-	    case has_lock(Q, Tid) of
-		true ->
-		    V1 = V+1,
-		    Q1 = move_to_last(Q, Tid, V),
-		    L1 = L#lock{version = V1, queue = Q1},
-		    ets:insert(Locks, L1),
-		    [L1];
-		false ->
-		    %% ignore (?)
-		    []
-	    end;
-	[] ->
-	    %% ignore (?)
-	    []
-    end.
+check_tids(false, _, _, _, _) ->
+    false;
+check_tids(true, ID, Tid, Result, Tids) ->
+    #lock{queue = Q} = lists:keyfind(ID, #lock.object, Result),
+    ets:insert(Tids, [{T, ID} || #entry{agent = T} <- flatten_queue(Q),
+				 T =/= Tid]).
 
-has_lock([#w{entry = #entry{agent = A}}|_], A) ->
-    true;
+flatten_queue(Q) ->
+    flatten_queue(Q, []).
+
+%% NOTE! This function doesn't preserve order;
+%% it returns a flat list of #entry{} records from the queue.
+flatten_queue([#r{entries = Es}|Q], Acc) ->
+    flatten_queue(Q, Es ++ Acc);
+flatten_queue([#w{entry = E}|Q], Acc) ->
+    flatten_queue(Q, [E|Acc]);
+flatten_queue([], Acc) ->
+    Acc.
+
+do_surrender(ID, Tid, {Locks, _Tids}) ->
+    Related = related_locks(ID, Locks),
+    Surrender = [L || L <- Related,
+		      has_lock(L#lock.queue, Tid)],
+    Updated =
+	lists:map(
+	  fun(#lock{queue = Q, version = V} = L) ->
+		  V1 = V+1,
+		  Q1 = move_to_last(Q, Tid, V),
+		  L#lock{version = V1, queue = Q1}
+	  end, Surrender),
+    ets:insert(Locks, Updated),
+    Updated.
+
+has_lock([#w{entry = #entry{agent = A1}}|_], A) ->
+    A1 =:= A;
 has_lock([#r{entries = Es}|_], A) ->
     lists:keymember(A, #entry.agent, Es).
 
@@ -237,7 +253,6 @@ do_remove_agent_([{A, ID}|T], Locks, Acc) ->
 		      (E, Acc1) ->
 			   [E|Acc1]
 		   end, [], Q),
-	    %% Q1 = [E || #entry{agent = Ax} = E <- Q, Ax == A],
 	    if Q1 == [] ->
 		    ets:delete(Locks, ID);
 	       true ->
@@ -281,7 +296,7 @@ insert_agent([], ID, A, Mode, Vsn) ->
 	     write -> [#w{entry = Entry}]
 	 end,
     L = #lock{object = ID, version = Vsn, queue = Q},
-    [L];
+    {false, [L]};
 insert_agent([_|_] = Related, ID, A, Mode, Vsn) ->
     %% Append entry to existing locks. Main challenge is merging child lock
     %% queues.
@@ -292,30 +307,32 @@ insert_agent([_|_] = Related, ID, A, Mode, Vsn) ->
 	{[], [], [_|_] = Children} ->
 	    %% Collect child lock queues
 	    {Children1, Queue} = update_children(Children, Entry, Mode, Vsn),
-	    [#lock{object = ID, version = Vsn,
-		   queue = into_queue(Mode, Queue, Entry#entry{type = direct})}
-	     | Children1];
+	    {true, [#lock{object = ID, version = Vsn,
+			  queue = into_queue(
+				    Mode, Queue, Entry#entry{type = direct})}
+		    | Children1]};
 	{[_|_] = Parents, [], Children} ->
 	    {Parents1, Queue} = update_parents(Parents, Entry, Mode, Vsn),
 	    Children1 = append_entry(Children, Entry, Mode, Vsn),
-	    Parents1 ++ [#lock{object = ID, version = Vsn,
-			       queue = into_queue(
-					 Mode, Queue,
-					 Entry#entry{type = direct})}
-			 | Children1];
+	    {true, Parents1 ++ [#lock{object = ID, version = Vsn,
+				      queue = into_queue(
+						Mode, Queue,
+						Entry#entry{type = direct})}
+				| Children1]};
 	{Parents, #lock{queue = Queue} = Mine, Children} ->
 	    case in_queue(Queue, A, Mode) of
 		false ->
 		    Parents1 = append_entry(Parents, Entry, Mode, Vsn),
 		    Children1 = append_entry(Children, Entry, Mode, Vsn),
-		    Parents1 ++ [Mine#lock{version = Vsn,
-					   queue =
-					       into_queue(
-						 Mode, Queue,
-						 Entry#entry{type = direct})}
-				 | Children1];
+		    {false, Parents1 ++
+			 [Mine#lock{version = Vsn,
+				    queue =
+					into_queue(
+					  Mode, Queue,
+					  Entry#entry{type = direct})}
+			  | Children1]};
 		true ->
-		    []
+		    {false, []}
 	    end
     end.
 
