@@ -206,8 +206,6 @@ init(Opts) ->
 handle_call({lock, Object, Mode, Nodes, Require, Wait} = _Request, {Client, Tag},
             #state{requests = Reqs} = State)
   when Client==?myclient ->
-    %% TODO: if we already have a request on Object,
-    %% we have to detect that here, and do something really clever...
     ?dbg("~p: Req = ~p~n", [self(), _Request]),
     case lists:keyfind(Object, 1, Reqs) of
         false ->
@@ -344,7 +342,7 @@ request_can_be_served(Obj, #state{down = Down, requests = Reqs}) ->
             case R of
                 all      -> intersection(Down, Ns) == [];
                 any      -> Ns -- Down =/= [];
-                majority -> length(Ns -- Down) < length(Ns)
+                majority -> length(Ns -- Down) >= (length(Ns) div 2)
             end;
         false ->
             false
@@ -571,11 +569,30 @@ waiting_for_ack(#state{sync = Sync}, LockID) ->
     lists:member(LockID, Sync).
 
 -spec waitingfor(#state{}) -> [pid()].
-waitingfor(#state{locks = Locks, pending = Pending}) ->
+waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs}) ->
     HaveLocks = [L#lock.object || L <- Locks,
                                   in(self(), hd(L#lock.queue))],
+    PendingTrimmed =
+        lists:foldl(
+          fun(#req{object = OID, require = majority, nodes = Ns}, Acc) ->
+                  NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
+                  case length(NodesLocked) >= (length(Ns) div 2) of
+                      true ->
+                          [ID || {O,_} = ID <- Acc, O =/= OID];
+                      false ->
+                          Acc
+                  end;
+             (#req{object = OID, require = any, nodes = Ns}, Acc) ->
+                  case [1 || {O,N} <- HaveLocks, O == OID, member(N, Ns)] of
+                      [] -> Acc;
+                      [_|_] ->
+                          [ID || {O,_} = ID <- Acc, O =/= OID]
+                  end;
+             (_, Acc) ->
+                  Acc
+          end, Pending, Reqs),
     ?dbg("HaveLocks = ~p~n", [HaveLocks]),
-    Pending -- HaveLocks.
+    PendingTrimmed -- HaveLocks.
 
 i_add_lock(#state{locks = Locks, sync = Sync} = State,
            #lock{object = Obj} = Lock) ->

@@ -28,6 +28,25 @@ run_test_() ->
       , ?_test(two_clients_direct_deadlock())
       , ?_test(three_clients_deadlock())
       , ?_test(two_clients_hierarchical_deadlock())
+      , {setup,
+         fun() ->
+                 start_slaves([locks_1, locks_2]),
+                 Nodes = nodes(),
+                 io:fwrite(user, "Nodes = ~p~n", [Nodes]),
+                 rpc:multicall(Nodes, application, start, [locks]),
+                 Nodes
+         end,
+         fun(_Ns) ->
+                 ok
+         end,
+         fun(Ns) ->
+                 {inorder,
+                  [
+                   ?_test(d_simple_lock_all(Ns))
+                   , ?_test(d_simple_lock_majority(Ns))
+                   , ?_test(d_simple_lock_any(Ns))
+                  ]}
+         end}
      ]}.
 
 -define(LA, locks_agent).
@@ -95,6 +114,31 @@ two_clients_hierarchical_deadlock() ->
        {2, ?LINE, ?MODULE, client_result, [],
         fun(normal, {ok, [_|_]}, St) -> St end},
        {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+d_simple_lock_all(Ns) ->
+    script(
+      [1],
+      [{1, ?LINE, ?LA, lock, ['$agent', [a], write, [node()|Ns], all],
+        match({ok, []})},
+       {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+d_simple_lock_majority(Ns) ->
+    [_, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
+    Dead = list_to_atom("dead_1@" ++ Host),
+    script(
+      [1],
+      [{1, ?LINE, ?LA, lock, ['$agent', [a], write, [Dead|Ns], majority],
+        match({ok, []})},
+       {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+d_simple_lock_any(Ns) ->
+    [_, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
+    Dead = list_to_atom("dead_1@" ++ Host),
+    script(
+      [1],
+      [{1, ?LINE, ?LA, lock, ['$agent', [a], write, [Dead,hd(Ns)], any],
+        match({ok, []})},
+       {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 script(Agents, S) ->
     AgentPids = [spawn_agent(A) || A <- Agents],
@@ -211,3 +255,43 @@ match(Catch, Const) ->
     fun(Ca, Co, St) when Ca == Catch, Co == Const ->
             St
     end.
+
+
+%% ==== slave setup
+
+start_slaves(Ns) ->
+    [H|T] = Nodes = [start_slave(N) || N <- Ns],
+    _ = [rpc:call(H, net_adm, ping, [N]) || N <- T],
+    Nodes.
+
+start_slave(Name) ->
+    case node() of
+        nonode@nohost ->
+            os:cmd("epmd -daemon"),
+            {ok, _} = net_kernel:start([locks_master, shortnames]);
+        _ ->
+            ok
+    end,
+    {Pa, Pz} = paths(),
+    Paths = "-pa ./ -pz ../ebin" ++
+        lists:flatten([[" -pa " ++ Path || Path <- Pa],
+		       [" -pz " ++ Path || Path <- Pz]]),
+    {ok, Node} = slave:start(host(), Name, Paths),
+    %% io:fwrite(user, "Slave node: ~p~n", [Node]),
+    Node.
+
+paths() ->
+    Path = code:get_path(),
+    {ok, [[Root]]} = init:get_argument(root),
+    {Pas, Rest} = lists:splitwith(fun(P) ->
+					  not lists:prefix(Root, P)
+				  end, Path),
+    {_, Pzs} = lists:splitwith(fun(P) ->
+				       lists:prefix(Root, P)
+			       end, Rest),
+    {Pas, Pzs}.
+
+
+host() ->
+    [_Name, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
+    list_to_atom(Host).
