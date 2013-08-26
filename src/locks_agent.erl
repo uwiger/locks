@@ -42,7 +42,11 @@
 
 -include("locks.hrl").
 
+-ifdef(TEST).
 -define(dbg(Fmt, Args), io:fwrite(user, Fmt, Args)).
+-else.
+-define(dbg(F, A), ok).
+-endif.
 
 -type agent()    :: pid().
 -type notify_type() :: await_all_locks
@@ -148,9 +152,31 @@ lock(Agent, [_|_] = Obj, Mode, [_|_] = Where, R)
 lock_(Agent, Obj, Mode, Where, R, Wait) ->
     case lists:all(fun is_atom/1, Where) of
         true ->
-            lock_return(Wait, call(Agent, {lock, Obj, Mode, Where, R, Wait}));
+            Ref = case Wait of
+                      wait -> erlang:monitor(process, Agent);
+                      nowait -> nowait
+                  end,
+            lock_return(
+              Wait,
+              cast(Agent, {lock, Obj, Mode, Where, R, Wait, self(), Ref}, Ref));
         false ->
             error({invalid_nodes, Where})
+    end.
+
+cast(Agent, Msg, Ref) ->
+    gen_server:cast(Agent, Msg),
+    await_reply(Ref).
+
+await_reply(nowait) ->
+    ok;
+await_reply(Ref) ->
+    receive
+        {'DOWN', Ref, _, _, Reason} ->
+            error(Reason);
+        {Ref, {abort, Reason}} ->
+            error(Reason);
+        {Ref, Reply} ->
+            Reply
     end.
 
 lock_return(wait, {have_all_locks, Deadlocks}) ->
@@ -167,15 +193,15 @@ lock_nowait(A, O, M, W, R) -> lock_(A, O, M, W, R, nowait).
 
 lock_objects(Agent, Objects) ->
     lists:foreach(fun({Obj, Mode}) when Mode == read; Mode == write ->
-                          lock(Agent, Obj, Mode);
+                          lock_nowait(Agent, Obj, Mode);
                      ({Obj, Mode, Where}) when Mode == read; Mode == write ->
-                          lock(Agent, Obj, Mode, Where);
+                          lock_nowait(Agent, Obj, Mode, Where);
                      ({Obj, Mode, Where, Req})
                         when (Mode == read orelse Mode == write)
                              andalso (Req == all
                                       orelse Req == any
                                       orelse Req == majority) ->
-                          lock(Agent, Obj, Mode, Where);
+                          lock_nowait(Agent, Obj, Mode, Where);
                      (L) ->
                           error({illegal_lock_pattern, L})
                   end, Objects).
@@ -219,32 +245,6 @@ init(Opts) ->
            options = Opts,
            answer = locking}}.
 
-handle_call({lock, Object, Mode, Nodes, Require, Wait} = _Request, {Client, Tag},
-            #state{requests = Reqs} = State)
-  when Client==?myclient ->
-    ?dbg("~p: Req = ~p~n", [self(), _Request]),
-    case lists:keyfind(Object, 1, Reqs) of
-        false ->
-            Req = #req{object = Object,
-                       mode = Mode,
-                       nodes = Nodes,
-                       require = Require},
-            S1 = lists:foldl(
-                   fun(Node, Sx) ->
-                           OID = {Object, Node},
-                           request_lock(
-                             OID, Mode, ensure_monitor(Node, Sx))
-                   end, State#state{requests = [Req|Reqs]}, Nodes),
-            maybe_reply(Wait, ok, Client, Tag, S1);
-        #req{nodes = Nodes, require = Require} ->
-            %% Repeated request
-            maybe_reply(Wait, ok, Client, Tag, State);
-        #req{nodes = PrevNodes} ->
-            %% Different conditions from last time
-            Reason = {conflicting_request,
-                      [Object, Nodes, PrevNodes]},
-            {stop, Reason, {error, Reason}, State}
-    end;
 handle_call(lock_info, _From, #state{locks = Locks,
                                      pending = Pending} = State) ->
     {reply, {Pending, Locks}, State};
@@ -283,11 +283,37 @@ handle_call(stop, {Client, _}, State) when Client==?myclient ->
 handle_call(R, _, State) ->
     {reply, {unknown_request, R}, State}.
 
+handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
+            #state{requests = Reqs} = State)
+  when Client==?myclient ->
+    ?dbg("~p: Req = ~p~n", [self(), _Request]),
+    case lists:keyfind(Object, 1, Reqs) of
+        false ->
+            Req = #req{object = Object,
+                       mode = Mode,
+                       nodes = Nodes,
+                       require = Require},
+            S1 = lists:foldl(
+                   fun(Node, Sx) ->
+                           OID = {Object, Node},
+                           request_lock(
+                             OID, Mode, ensure_monitor(Node, Sx))
+                   end, State#state{requests = [Req|Reqs]}, Nodes),
+            maybe_reply(Wait, Client, Tag, S1);
+        #req{nodes = Nodes, require = Require} ->
+            %% Repeated request
+            maybe_reply(Wait, Client, Tag, State);
+        #req{nodes = PrevNodes} ->
+            %% Different conditions from last time
+            Reason = {conflicting_request,
+                      [Object, Nodes, PrevNodes]},
+            {stop, Reason, {error, Reason}, State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, State0) ->
-    ?dbg("~p: handle_info(~p~n", [self(), I]),
+handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = _I, State0) ->
+    ?dbg("~p: handle_info(~p~n", [self(), _I]),
     LockID = {Lock0#lock.object, Node},
     Lock = Lock0#lock{object = LockID},
     State = check_note(Note, LockID, State0),
@@ -335,23 +361,26 @@ handle_info({'EXIT', Client, Reason}, #state{client = Client} = S) ->
 handle_info(_, State) ->
     {noreply,State}.
 
-maybe_reply(nowait, Reply, _, _, State) ->
-    {reply, Reply, State};
-maybe_reply(wait, _, Client, Tag, State) ->
+maybe_reply(nowait, _, _, State) ->
+    {noreply, State};
+maybe_reply(wait, Client, Tag, State) ->
     await_all_locks_(Client, Tag, State).
 
 await_all_locks_(Client, Tag, State) ->
     case all_locks_status(State) of
         no_locks ->
-	    {reply, {error, no_locks}, State};
+            gen_server:reply({Client, Tag}, {error, no_locks}),
+	    {noreply, State};
         {have_all, Deadlocks} ->
-            {reply, {have_all_locks, Deadlocks}, State};
+            gen_server:reply({Client, Tag}, {have_all_locks, Deadlocks}),
+            {noreply, State};
         waiting ->
             Entry = {Client, Tag, await_all_locks},
             {noreply, State#state{notify = [Entry|State#state.notify]}};
         {cannot_serve, Objs} ->
             Reason = {could_not_lock_objects, Objs},
-            {stop, Reason, {error, Reason}, State}
+            gen_server:reply({Client, Tag}, Reason),
+            {stop, {error, Reason}, State}
     end.
 
 request_can_be_served(Obj, #state{down = Down, requests = Reqs}) ->
@@ -408,8 +437,8 @@ request_lock({OID, Node} = LockID, Mode, #state{pending = Reqs} = State) ->
     locks_server:lock(OID, [Node], Mode),
     State#state{pending = [LockID | Reqs -- [LockID]]}.
 
-request_surrender({OID, Node} = LockID, #state{}) ->
-    ?dbg("request_surrender(~p~n", [LockID]),
+request_surrender({OID, Node} = _LockID, #state{}) ->
+    ?dbg("request_surrender(~p~n", [_LockID]),
     locks_server:surrender(OID, Node).
 
 check_if_done(#state{pending = []} = State) ->
@@ -700,6 +729,11 @@ uniq(L) ->
 %% surrender which object.
 %%
 analyse(_Agents, Locks) ->
+    %% No need to analyse locks that have no waiters
+    InterestingLocks = [L || #lock{queue = [_,_|_]} = L <- Locks],
+    analyse_(InterestingLocks).
+
+analyse_(Locks) ->
     Nodes =
 	expand_agents([ {hd(L#lock.queue), L#lock.object} || L <- Locks ]),
     Connect =

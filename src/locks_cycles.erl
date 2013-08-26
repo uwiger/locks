@@ -19,6 +19,12 @@
 
 -module(locks_cycles).
 
+-ifdef(TEST).
+-define(dbg(Fmt, Args), io:fwrite(Fmt, Args)).
+-else.
+-define(dbg(Fmt, Args), ok).
+-endif.
+
 -export([components/2, ex/1]).
 
 -import(lists, [member/2, keysearch/3, delete/2, map/2]).
@@ -30,7 +36,7 @@ components(Nodes,Arrow) ->
     map(fun(Node) ->
            {Node, [ N || N <- Nodes, Arrow(Node, N)]}
         end,Nodes),
-    io:fwrite("Graph = ~p~n", [Graph]),
+    ?dbg("Graph = ~p~n", [Graph]),
   [ Comp || Comp<-sc(Nodes, Graph, [], []), oncycle(Comp, Arrow)].
 
 oncycle([A], Arrow) ->

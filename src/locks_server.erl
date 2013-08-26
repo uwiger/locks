@@ -26,6 +26,12 @@
 	 terminate/2,
 	 code_change/3]).
 
+-ifdef(TEST).
+-define(dbg(Fmt, Args), io:fwrite(Fmt, Args)).
+-else.
+-define(dbg(F,A), ok).
+-endif.
+
 -include("locks.hrl").
 
 -record(st, {tabs = {ets:new(locks, [public, ordered_set, {keypos, 2}]),
@@ -539,21 +545,21 @@ lock_test_() ->
 simple_lock() ->
     Msgs1 = req(lock, [<<"a">>, <<"1">>], write),
     [#locks_info{lock = #lock{object = [<<"a">>, <<"1">>]}}] = Msgs1,
-    io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs1]),
+    ?dbg("~p - msgs: ~p~n", [?LINE, Msgs1]),
     Msgs2 = req(lock, [<<"a">>, <<"1">>, <<"x">>], read),
-    io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs2]),
+    ?dbg("~p - msgs: ~p~n", [?LINE, Msgs2]),
     Msgs3 = req(lock, [<<"a">>], read),
-    io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs3]),
+    ?dbg("~p - msgs: ~p~n", [?LINE, Msgs3]),
     remove_agent([node()]),
     ok.
 
 simple_upgrade() ->
     Msgs1 = req(lock, [<<"a">>, <<"1">>], read),
-    io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs1]),
+    ?dbg("~p - msgs: ~p~n", [?LINE, Msgs1]),
     Msgs2 = req(lock, [<<"a">>, <<"1">>, <<"x">>], write),
-    io:fwrite(user, "~p - msgs: = ~p~n", [?LINE, Msgs2]),
+    ?dbg("~p - msgs: = ~p~n", [?LINE, Msgs2]),
     Msgs3 = req(lock, [<<"a">>], read),
-    io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs3]),
+    ?dbg("~p - msgs: ~p~n", [?LINE, Msgs3]),
     ok.
 
 
