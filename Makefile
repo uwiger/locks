@@ -7,9 +7,10 @@ compile:
 
 clean:
 	rebar clean
+	rm doc/*.md doc/*.png doc/stylesheet.css
 
 test:
 	rebar eunit
 
 doc:
-	rebar doc
+	rebar get-deps compile doc

@@ -1,13 +1,9 @@
+@author Ulf Wiger <ulf@wiger.net>
+@author Thomas Arts <thomas@quviq.com>
 
+@doc Scalable deadlock-resolving locking system
 
-# The locks application #
-
-__Authors:__ Ulf Wiger ([`ulf@wiger.net`](mailto:ulf@wiger.net)), Thomas Arts ([`thomas@quviq.com`](mailto:thomas@quviq.com)).
-
-Scalable deadlock-resolving locking system
-
-
-## locks ##
+<h2>locks</h2>
 
 A scalable, deadlock-resolving resource locker
 
@@ -34,37 +30,36 @@ have had to surrender a lock. This might be preferrable in some cases, and
 will still only happen if there is an actual deadlock. It is usually possible
 to design a system so that deadlocks will not occur during normal operation.
 
+<h2>Using 'locks'</h2>
 
-## Using 'locks' ##
-
-Call `application:start(locks)` on each node that needs to participate in
+Call `application:start(locks)' on each node that needs to participate in
 locking.
 
-
-## Structure of locks ##
+<h2>Structure of locks</h2>
 
 The lock identifiers used by 'locks' are non-empty lists of key elements.
 
-The lock table is viewed as a tree, and e.g. `[a]` implicitly locks `[a,1]`,
-`[a,2]`, etc. Locks can be `read` (shared) or `write` (exclusive). Shared locks
+The lock table is viewed as a tree, and e.g. `[a]' implicitly locks `[a,1]',
+`[a,2]', etc. Locks can be `read' (shared) or `write' (exclusive). Shared locks
 are automatically upgraded to exclusive locks if requested (and if possible).
 
 Using 'locks' in a database system, one might use a lock naming scheme like
-`[DbInstance, Table, Lock]`, where `[DbInstance]` would be equivalent to a
-schema lock, `[DbInstance, Table]` a table lock, etc.
+`[DbInstance, Table, Lock]', where `[DbInstance]' would be equivalent to a
+schema lock, `[DbInstance, Table]' a table lock, etc.
 
 There is only one lock table per Erlang node, so use prefixed keys, or a
 unique top-level key.
 
+<h2>Agents</h2>
 
-## Agents ##
-
-While it is possible to use the `locks_server` API directly to lock single
+While it is possible to use the `locks_server' API directly to lock single
 objects, distributed locking and deadlock detection is done by `locks_agent`.
 
-Agents are started e.g. using `locks_agent:begin_transaction(...)`, and are
-separate state machines (processes). The `locks_server` informs agents via
-`#locks_info{}` messages (containing not only the ID of the agent that holds
+The official API to use is `locks'.
+
+Agents are started e.g. using `locks_agent:begin_transaction(...)', and are
+separate state machines (processes). The `locks_server' informs agents via
+`#locks_info{}' messages (containing not only the ID of the agent that holds
 a lock, but also of any agents waiting for one), and each agent keeps track
 of a dependency graph. Agents inform each other ('younger' agents inform
 'older' agents) of indirect dependencies, using an algorithm that guarantees
@@ -73,31 +68,21 @@ that one involved agent will eventually have enough data to detect any deadlock.
 If a deadlock is detected, the 'oldest' agent must yield its lock. This is
 either done as a 'surrender', where the agent yields the lock and is placed
 last in the lock's wait queue, or by aborting. Which behavior is used is
-controlled by the option `{abort_on_deadlock, bool()}`, given at the beginning
+controlled by the option `{abort_on_deadlock, bool()}', given at the beginning
 of the transaction.
 
+<h2>Distributed locking</h2>
 
-## Distributed locking ##
-
-Using the function `locks_agent:lock(Agent, LockID, Mode, Nodes, Req)`, a lock
+Using the function `locks:lock(Agent, LockID, Mode, Nodes, Req)', a lock
 can be acquired on several nodes at once.
 
-```erlang
-
+<pre lang="erlang">
 Agent  :: pid().
 LockID :: [any()].
 Mode   :: read | write.
 Nodes  :: [node()].
 Req    :: all | any | majority.
+</pre>
 
-```
 The agent monitors the lock servers on each node. If it determines that too
 few lock servers are available to fulfill the lock requirement, it will abort.
-
-## Modules ##
-
-
-<table width="100%" border="0" summary="list of modules">
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_agent.md" class="module">locks_agent</a></td></tr>
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_server.md" class="module">locks_server</a></td></tr></table>
-

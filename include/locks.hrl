@@ -16,14 +16,29 @@
 -type mode()     :: read | write.
 -type where()    :: [node()].
 -type req()      :: any | all | majority.
--type locktype() :: direct | indirect.
+-type agent()    :: pid().
 -type tid()      :: any().
 
+-type lock_id()  :: {oid(), node()}.
+
 -type obj()      :: {oid(), mode()}
-		  | {oid(), mode()}
 		  | {oid(), mode(), where()}
 		  | {oid(), mode(), where(), req()}.
+
 -type objs()     :: [obj()].
+
+-type options() :: [{link, boolean()}
+		    | {client, pid()}
+		    | {abort_on_error, boolean()}
+		    | {abort_on_deadlock, boolean()}].
+
+-type deadlocks() :: [lock_id()].
+
+-type lock_status() :: have_all_locks | have_none.
+-type lock_result()  :: {lock_status(), deadlocks()}.
+
+-type locktype() :: direct | indirect.
+
 
 -record(entry, {
 	  agent         :: pid(),
@@ -40,10 +55,10 @@
 	 }).
 
 -record(lock, {
-	  object       :: oid(),
-	  version = 1  :: integer(),
-	  pid = self() :: pid(),
-	  queue = []   :: [#entry{}]}).
+	  object = []  :: oid() | lock_id() | '_',
+	  version = 1  :: integer()     | '_',
+	  pid = self() :: pid()         | '_',
+	  queue = []   :: [#r{} | #w{}] | '_'}).
 
 -record(locks_info, {
 	  lock,

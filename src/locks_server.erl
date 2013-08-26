@@ -79,13 +79,6 @@ remove_agent(Nodes, Agent) when is_list(Nodes) ->
     [cast({?LOCKER, N}, {remove_agent, {self(), Agent}}) || N <- Nodes],
     ok.
 
-cast({n,Scope,_} = Name, Msg) when Scope==l;
-				   Scope==g ->
-    gen_server:cast({via, gproc, Name}, Msg);
-cast(Pid, Msg) when is_pid(Pid) ->
-    gen_server:cast(Pid, Msg);
-cast(Name, Msg) when is_atom(Name) ->
-    gen_server:cast(Name, Msg);
 cast({Name, Node} = P, Msg) when is_atom(Name), is_atom(Node) ->
     gen_server:cast(P, Msg).
 
@@ -138,8 +131,6 @@ notify([#lock{queue = Q} = H|T], Me, Note) ->
 notify([], _, _) ->
     ok.
 
-send({Pid,_}, Msg) when is_pid(Pid) ->
-    Pid ! Msg;
 send(Pid, Msg) when is_pid(Pid) ->
     Pid ! Msg.
 

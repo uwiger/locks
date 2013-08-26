@@ -1,0 +1,3 @@
+{application,locks}.
+{packages,[]}.
+{modules,[locks_agent,locks_server]}.

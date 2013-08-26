@@ -16,6 +16,7 @@
 %%
 %% freely taken from Peter Hogfeldt
 %%
+%% @private
 
 -module(locks_cycles).
 

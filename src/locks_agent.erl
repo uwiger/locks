@@ -48,13 +48,9 @@
 -define(dbg(F, A), ok).
 -endif.
 
--type agent()    :: pid().
 -type notify_type() :: await_all_locks
                        %%		     | await_all_or_none
 		     | events.
--type lock_status() :: have_all_locks | have_none.
--type deadlocks()   :: [{agent(), oid()}].
--type lock_reply()  :: {lock_status(), deadlocks()}.
 -type option()      :: {client, pid()}
                      | {abort_on_exit, boolean()}.
 
@@ -68,8 +64,8 @@
           requests = []  :: [#req{}],
           down = []      :: [node()],
           monitored = [] :: [{node(), reference()}],
-          pending = []   :: [oid()],
-          sync = []      :: [pid()],
+          pending = []   :: [lock_id()],
+          sync = []      :: [#lock{}],
           client         :: pid(),
           client_mref    :: reference(),
           options = []   :: [option()],
@@ -102,26 +98,20 @@ start(Options0) when is_list(Options0) ->
             gen_server:start(?MODULE, Options, [])
     end.
 
--spec begin_transaction([oid()
-                         | {oid(), mode()}
-                         | {oid(), mode(), where()}]) ->
-                               {agent(), lock_reply()}.
+-spec begin_transaction(objs()) -> {agent(), lock_result()}.
 begin_transaction(Objects) ->
     begin_transaction(Objects, []).
 
+-spec begin_transaction(objs(), options()) -> {agent(), lock_result()}.
 begin_transaction(Objects, Opts) ->
     {ok, Agent} = start(Opts),
     _ = lock_objects(Agent, Objects),
     {Agent, await_all_locks(Agent)}.
 
 
--spec await_all_locks(agent()) -> lock_reply().
+-spec await_all_locks(agent()) -> lock_result().
 await_all_locks(Agent) ->
     call(Agent, await_all_locks,infinity).
-
-%% -spec await_all_or_none(agent()) -> lock_reply().
-%% await_all_or_none(Agent) ->
-%%     call(Agent, await_all_or_none, infinity).
 
 
 -spec end_transaction(agent()) -> ok.
@@ -129,21 +119,23 @@ end_transaction(Agent) when is_pid(Agent) ->
     call(Agent,stop).
 
 -spec lock(pid(), oid()) -> {ok, list()}.
--spec lock(pid(), oid(), mode()) -> {ok, list()}.
--spec lock(pid(), oid(), mode(), [node()], req()) -> {ok, list()}.
-
--spec lock_objects(pid(), objs()) -> ok.
-
+%%
 lock(Agent, [_|_] = Obj) when is_pid(Agent) ->
     lock_(Agent, Obj, write, [node()], all, wait).
 
+-spec lock(pid(), oid(), mode()) -> {ok, list()}.
+%% @equiv lock(Agent, Obj, Mode, [node()], all, wait)
 lock(Agent, [_|_] = Obj, Mode)
   when is_pid(Agent) andalso (Mode==read orelse Mode==write) ->
     lock_(Agent, Obj, Mode, [node()], all, wait).
 
+-spec lock(pid(), oid(), mode(), [node()]) -> {ok, list()}.
+%%
 lock(Agent, [_|_] = Obj, Mode, [_|_] = Where) ->
     lock_(Agent, Obj, Mode, Where, all, wait).
 
+-spec lock(pid(), oid(), mode(), [node()], req()) -> {ok, list()}.
+%%
 lock(Agent, [_|_] = Obj, Mode, [_|_] = Where, R)
   when is_pid(Agent) andalso (Mode == read orelse Mode == write)
        andalso (R == all orelse R == any orelse R == majority) ->
@@ -191,6 +183,9 @@ lock_nowait(A, O, M) -> lock_(A, O, M, [node()], all, nowait).
 lock_nowait(A, O, M, W) -> lock_(A, O, M, W, all, nowait).
 lock_nowait(A, O, M, W, R) -> lock_(A, O, M, W, R, nowait).
 
+
+-spec lock_objects(pid(), objs()) -> ok.
+%%
 lock_objects(Agent, Objects) ->
     lists:foreach(fun({Obj, Mode}) when Mode == read; Mode == write ->
                           lock_nowait(Agent, Obj, Mode);
@@ -224,6 +219,7 @@ call(A, Req, Timeout) ->
 
 %% callback functions
 
+%% @private
 init(Opts) ->
     case OnExit = proplists:get_value(abort_on_exit, Opts, true) of
 	false ->
@@ -245,19 +241,21 @@ init(Opts) ->
            options = Opts,
            answer = locking}}.
 
+%% @private
 handle_call(lock_info, _From, #state{locks = Locks,
                                      pending = Pending} = State) ->
     {reply, {Pending, Locks}, State};
-handle_call({prepare, Ops}, {Client, _} = From, State)
+handle_call({prepare, Ops}, {Client, _}, State)
   when Client =:= ?myclient ->
     case waitingfor(State) of
         [] ->
             case check_prepare(Ops, State) of
-                {ok, State1} -> {reply, ok, State1};
-                {error, Reason} ->
-                    %% Automatically abort
-                    gen_server:reply(From, Err = {abort, {prepare_error, Reason}}),
-                    {stop, Err, State}
+                {ok, State1} -> {reply, ok, State1}
+              %% ; {error, Reason} ->
+              %%       %% Automatically abort
+              %%       gen_server:reply(
+              %%         From, Err = {abort, {prepare_error, Reason}}),
+              %%       {stop, Err, State}
             end;
         [_|_] ->
             {reply, {error, awaiting_locks}, State}
@@ -270,19 +268,12 @@ handle_call(await_all_locks, {Client, Tag}, State) when Client =:= ?myclient ->
           [{O,Q} || #lock{object = O,
                           queue = Q} <- State#state.locks]]),
     await_all_locks_(Client, Tag, State);
-%% handle_call(await_all_or_none, {Client, Tag}, State) when Client==?myclient ->
-%%     case someone_locks_all(State) of
-%% 	{true, Which} ->
-%% 	    {reply, {Which, State#state.deadlocks}, State};
-%% 	_ ->
-%% 	    Entry = {Client, Tag, await_all_or_none},
-%% 	    {noreply, State#state{notify = [Entry|State#state.notify]}}
-%%     end;
 handle_call(stop, {Client, _}, State) when Client==?myclient ->
     {stop, normal, ok, State};
 handle_call(R, _, State) ->
     {reply, {unknown_request, R}, State}.
 
+%% @private
 handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
             #state{requests = Reqs} = State)
   when Client==?myclient ->
@@ -312,6 +303,7 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% @private
 handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = _I, State0) ->
     ?dbg("~p: handle_info(~p~n", [self(), _I]),
     LockID = {Lock0#lock.object, Node},
@@ -473,46 +465,6 @@ notify(Msg, #state{notify = Notify} = State) ->
           end, Notify),
     State#state{notify = NewNotify}.
 
-%% check_if_done(#state{notify = Notify} = State) ->
-%%     case have_info_on_all_locks(State#state.pending, State#state.locks) of
-%% 	false ->
-%% 	    ?dbg("~p: don't yet have all info~n"
-%% 		 "Reqs = ~p; Locks = ~p~n", [self(), State#state.pending,
-%% 					     State#state.locks]),
-%% 	    State;
-%% 	true ->
-%% 	    DLs = State#state.deadlocks,
-%% 	    case someone_locks_all(State) of
-%% 		{true, Pid} ->
-%% 		    Which = if Pid == self() -> have_all_locks;
-%% 			       true -> have_none
-%% 			    end,
-%% 		    Msg = {Which, State#state.deadlocks},
-%% 		    ?dbg("~p: ~p holds all locks~n", [self(), Pid]),
-%% 		    NewNotify =
-%% 			lists:filter(
-%% 			  fun({P, R, events}) ->
-%% 				  P ! {?MODULE, R, Msg},
-%% 				  true;
-%% 			     ({P, R, await_all_locks}) when Pid == self() ->
-%% 				  gen_server:reply({P,R}, Msg),
-%% 				  false;
-%% 			     ({P, R, await_all_or_none}) ->
-%% 				  gen_server:reply({P,R}, Msg),
-%% 				  false;
-%% 			     (_) ->
-%% 				  true
-%% 			  end, Notify),
-%% 		    State#state{notify = NewNotify};
-%% 		false ->
-%% 		    State
-%% 	    end
-%%     end.
-
-%% have_info_on_all_locks(Pending, Locks) ->
-%%     LockIDs = [L#lock.object || L <- Locks],
-%%     (Pending -- LockIDs) == [].
-
 
 handle_locks(#state{locks = Locks, deadlocks = Deadlocks} = State) ->
     InvolvedAgents =
@@ -577,9 +529,11 @@ send_surrender_info(Agents, #lock{object = OID, queue = Q}) ->
 send_lockinfo(Agent, #lock{object = {OID, Node}} = L) ->
     Agent ! #locks_info{lock = L#lock{object = OID}, where = Node}.
 
+%% @private
 terminate(_Reason, _State) ->
     ok.
 
+%% @private
 code_change(_FromVsn, State, _Extra) ->
     {ok, State}.
 
@@ -590,7 +544,9 @@ code_change(_FromVsn, State, _Extra) ->
 check_prepare(_Ops, State) ->
     {ok, State}.
 
--spec all_locks_status(#state{}) -> no_locks | waiting | {have_all, deadlocks()}.
+-spec all_locks_status(#state{}) ->
+                              no_locks | waiting | {have_all, deadlocks()}
+                                  | {cannot_serve, list()}.
 %%
 all_locks_status(#state{pending = Pending} = State) ->
     case Pending of
@@ -629,7 +585,7 @@ newer(Lock1, Lock2) ->
 waiting_for_ack(#state{sync = Sync}, LockID) ->
     lists:member(LockID, Sync).
 
--spec waitingfor(#state{}) -> [pid()].
+-spec waitingfor(#state{}) -> [lock_id()].
 waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs}) ->
     HaveLocks = [L#lock.object || L <- Locks,
                                   in(self(), hd(L#lock.queue))],
@@ -660,27 +616,8 @@ i_add_lock(#state{locks = Locks, sync = Sync} = State,
     State#state{locks = lists:keystore(Obj, #lock.object, Locks, Lock),
 		sync = lists:keydelete(Obj, #lock.object, Sync)}.
 
-%% -spec someone_locks_all(#state{}) -> boolean().
-%% someone_locks_all(#state{pending = Req, locks = Locks}) ->
-%%     LockHolders = [lock_holder(L, Locks) || L <- Req],
-%%     R = case lists:usort(LockHolders) of
-%% 	    [Pid] when is_pid(Pid) ->
-%% 		{true, Pid};
-%% 	    _ ->
-%% 		false
-%% 	end,
-%%     ?dbg("~p: someone_locks_all(~p, ~p) -> ~p~n", [self(), Req, Locks, R]),
-%%     R.
 
-%% -spec lock_holder(objectID(), [#lock{}]) -> pid() | none.
-%% lock_holder(Id, Locks) ->
-%%     case lists:keyfind(Id, #lock.object, Locks) of
-%% 	false -> none;
-%% 	#lock{queue = []} -> none;
-%% 	#lock{queue = [P|_]} -> P
-%%     end.
-
--spec compute_indirects(#state{}) -> [pid()].
+-spec compute_indirects([agent()]) -> [agent()].
 compute_indirects(InvolvedAgents) ->
     [ A || A<-InvolvedAgents, A>self()].
 %% here we impose a global
@@ -775,8 +712,6 @@ in_tail(A, Tail) ->
     lists:any(fun(X) ->
                       in(A, X)
               end, Tail).
-
-
 
 max_agent([{A, O}]) ->
     {A, O};

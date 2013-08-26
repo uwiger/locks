@@ -50,18 +50,17 @@ run_test_() ->
          end}
      ]}.
 
--define(LA, locks_agent).
 
 simple_lock() ->
-    script([1], [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok,[]})},
-                 {1, ?LINE, ?LA, end_transaction, ['$agent'], match(ok)},
+    script([1], [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
+                 {1, ?LINE, locks, end_transaction, ['$agent'], match(ok)},
                  {1, ?LINE, erlang, is_process_alive, ['$agent'], match(false)},
                  {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 one_lock_two_clients() ->
     script([1,2],
-           [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok,[]})},
-            {2, ?LINE, ?LA, lock, ['$agent', [a]], 100, match(timeout, timeout)},
+           [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
+            {2, ?LINE, locks, lock, ['$agent', [a]], 100, match(timeout, timeout)},
             {2, ?LINE, ?MODULE, client_waits, [], match(true)},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
@@ -69,10 +68,10 @@ one_lock_two_clients() ->
 
 two_clients_direct_deadlock() ->
     script([1,2],
-           [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok,[]})},
-            {2, ?LINE, ?LA, lock, ['$agent', [b]], match({ok,[]})},
-            {1, ?LINE, ?LA, lock, ['$agent', [b]], 100, match(timeout,timeout)},
-            {2, ?LINE, ?LA, lock, ['$agent', [a]], 100, match(timeout,timeout)},
+           [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
+            {2, ?LINE, locks, lock, ['$agent', [b]], match({ok,[]})},
+            {1, ?LINE, locks, lock, ['$agent', [b]], 100, match(timeout,timeout)},
+            {2, ?LINE, locks, lock, ['$agent', [a]], 100, match(timeout,timeout)},
             {1, ?LINE, ?MODULE, client_result, [],
              fun(normal, {ok, [_]}, St) -> St end},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -84,12 +83,12 @@ two_clients_direct_deadlock() ->
 three_clients_deadlock() ->
     script(
       [1,2,3],
-      [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok, []})},
-       {2, ?LINE, ?LA, lock, ['$agent', [b]], match({ok, []})},
-       {3, ?LINE, ?LA, lock, ['$agent', [c]], match({ok, []})},
-       {1, ?LINE, ?LA, lock, ['$agent', [c]], 100, match(timeout,timeout)},
-       {2, ?LINE, ?LA, lock, ['$agent', [a]], 100, match(timeout,timeout)},
-       {3, ?LINE, ?LA, lock, ['$agent', [b]], 100, match(timeout,timeout)},
+      [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok, []})},
+       {2, ?LINE, locks, lock, ['$agent', [b]], match({ok, []})},
+       {3, ?LINE, locks, lock, ['$agent', [c]], match({ok, []})},
+       {1, ?LINE, locks, lock, ['$agent', [c]], 100, match(timeout,timeout)},
+       {2, ?LINE, locks, lock, ['$agent', [a]], 100, match(timeout,timeout)},
+       {3, ?LINE, locks, lock, ['$agent', [b]], 100, match(timeout,timeout)},
        {1, ?LINE, ?MODULE, client_result, [],
         fun(normal, {ok, [_|_]}, St) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -105,10 +104,10 @@ three_clients_deadlock() ->
 two_clients_hierarchical_deadlock() ->
     script(
       [1,2],
-      [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok, []})},
-       {2, ?LINE, ?LA, lock, ['$agent', [b]], match({ok, []})},
-       {1, ?LINE, ?LA, lock, ['$agent', [b,1]], 100, match(timeout, timeout)},
-       {2, ?LINE, ?LA, lock, ['$agent', [a,1]], 100, match(timeout, timeout)},
+      [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok, []})},
+       {2, ?LINE, locks, lock, ['$agent', [b]], match({ok, []})},
+       {1, ?LINE, locks, lock, ['$agent', [b,1]], 100, match(timeout, timeout)},
+       {2, ?LINE, locks, lock, ['$agent', [a,1]], 100, match(timeout, timeout)},
        {1, ?LINE, ?MODULE, client_result, [],
         fun(normal, {ok, [_|_]}, St) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -119,10 +118,10 @@ two_clients_hierarchical_deadlock() ->
 two_clients_abort_on_deadlock() ->
     script(
       [1, {2, [{abort_on_deadlock, true},{link,false}]}],
-      [{1, ?LINE, ?LA, lock, ['$agent', [a]], match({ok, []})},
-       {2, ?LINE, ?LA, lock, ['$agent', [b]], match({ok, []})},
-       {1, ?LINE, ?LA, lock, ['$agent', [b]], 100, match(timeout,timeout)},
-       {2, ?LINE, ?LA, lock, ['$agent', [a]], match(error, '_')},
+      [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok, []})},
+       {2, ?LINE, locks, lock, ['$agent', [b]], match({ok, []})},
+       {1, ?LINE, locks, lock, ['$agent', [b]], 100, match(timeout,timeout)},
+       {2, ?LINE, locks, lock, ['$agent', [a]], match(error, '_')},
        {1, ?LINE, ?MODULE, client_result, [],
         fun(normal, {ok, _}, St) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -132,7 +131,7 @@ two_clients_abort_on_deadlock() ->
 d_simple_lock_all(Ns) ->
     script(
       [1],
-      [{1, ?LINE, ?LA, lock, ['$agent', [a], write, [node()|Ns], all],
+      [{1, ?LINE, locks, lock, ['$agent', [a], write, [node()|Ns], all],
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
@@ -141,7 +140,7 @@ d_simple_lock_majority(Ns) ->
     Dead = list_to_atom("dead_1@" ++ Host),
     script(
       [1],
-      [{1, ?LINE, ?LA, lock, ['$agent', [a], write, [Dead|Ns], majority],
+      [{1, ?LINE, locks, lock, ['$agent', [a], write, [Dead|Ns], majority],
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
@@ -150,7 +149,7 @@ d_simple_lock_any(Ns) ->
     Dead = list_to_atom("dead_1@" ++ Host),
     script(
       [1],
-      [{1, ?LINE, ?LA, lock, ['$agent', [a], write, [Dead,hd(Ns)], any],
+      [{1, ?LINE, locks, lock, ['$agent', [a], write, [Dead,hd(Ns)], any],
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 

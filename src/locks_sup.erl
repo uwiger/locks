@@ -11,6 +11,7 @@
 %% Key contributor: Thomas Arts <thomas.arts@quviq.com>
 %%
 %%=============================================================================
+%% @private
 
 -module(locks_sup).
 
