@@ -45,7 +45,7 @@
 	  pid = self() :: pid(),
 	  queue = []   :: [#entry{}]}).
 
--record(lock_info, {
+-record(locks_info, {
 	  lock,
 	  where = node(),
 	  note = []}).

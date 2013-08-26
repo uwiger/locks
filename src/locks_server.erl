@@ -126,7 +126,7 @@ notify(Locks, Me) ->
     notify(Locks, Me, []).
 
 notify([#lock{queue = Q} = H|T], Me, Note) ->
-    _ = [send(A, #lock_info{lock = H, note = Note})
+    _ = [send(A, #locks_info{lock = H, note = Note})
 	 || #entry{agent = A} <- queue_entries(Q)],
     notify(T, Me, Note);
 notify([], _, _) ->
@@ -538,7 +538,7 @@ lock_test_() ->
 
 simple_lock() ->
     Msgs1 = req(lock, [<<"a">>, <<"1">>], write),
-    [#lock_info{lock = #lock{object = [<<"a">>, <<"1">>]}}] = Msgs1,
+    [#locks_info{lock = #lock{object = [<<"a">>, <<"1">>]}}] = Msgs1,
     io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs1]),
     Msgs2 = req(lock, [<<"a">>, <<"1">>, <<"x">>], read),
     io:fwrite(user, "~p - msgs: ~p~n", [?LINE, Msgs2]),
@@ -560,14 +560,14 @@ simple_upgrade() ->
 req(lock, ID, Mode) ->
     lock(ID, Mode),
     timer:sleep(500),
-    lists:sort(fun(#lock_info{lock = #lock{object = A}},
-		   #lock_info{lock = #lock{object = B}}) ->
+    lists:sort(fun(#locks_info{lock = #lock{object = A}},
+		   #locks_info{lock = #lock{object = B}}) ->
 		       A =< B
 	       end, recv_replies()).
 
 recv_replies() ->
     receive
-	#lock_info{} = Msg ->
+	#locks_info{} = Msg ->
 	    [Msg | recv_replies()]
     after 0 ->
 	    []

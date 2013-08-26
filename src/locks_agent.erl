@@ -16,7 +16,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, start_link/1]).
+-export([start_link/0, start_link/1, start/1]).
 -export([begin_transaction/1,
 	 begin_transaction/2,
          %%	 acquire_all_or_none/2,
@@ -67,6 +67,7 @@
           pending = []   :: [oid()],
           sync = []      :: [pid()],
           client         :: pid(),
+          client_mref    :: reference(),
           options = []   :: [option()],
           abort_on_exit = true :: boolean(),
           notify = []    :: [{pid(), reference(), notify_type()}],
@@ -79,15 +80,23 @@
 %%% interface function
 
 start_link() ->
-    start_link([]).
+    start([{link, true}]).
 
-start_link(Options0) when is_list(Options0) ->
+start_link(Options) when is_list(Options) ->
+    start(lists:keystore(link, 1, Options, {link, true})).
+
+start(Options0) when is_list(Options0) ->
     Options =
 	case lists:keymember(client, 1, Options0) of
 	    true -> Options0;
 	    false -> [{client, self()}|Options0]
 	end,
-    gen_server:start_link(?MODULE, Options, []).
+    case proplists:get_value(link, Options, true) of
+        true ->
+            gen_server:start_link(?MODULE, Options, []);
+        false ->
+            gen_server:start(?MODULE, Options, [])
+    end.
 
 -spec begin_transaction([oid()
                          | {oid(), mode()}
@@ -97,7 +106,7 @@ begin_transaction(Objects) ->
     begin_transaction(Objects, []).
 
 begin_transaction(Objects, Opts) ->
-    {ok, Agent} = start_link(Opts),
+    {ok, Agent} = start(Opts),
     _ = lock_objects(Agent, Objects),
     {Agent, await_all_locks(Agent)}.
 
@@ -178,9 +187,14 @@ call(A, Req) ->
     call(A, Req, 5000).
 
 call(A, Req, Timeout) ->
-    Res = gen_server:call(A, Req, Timeout),
-    ?dbg("~p: call(~p, ~p) -> ~p~n", [self(), A, Req, Res]),
-    Res.
+    case gen_server:call(A, Req, Timeout) of
+        {abort, Reason} ->
+            ?dbg("~p: call(~p, ~p) -> ABORT:~p~n", [self(), A, Req, Reason]),
+            error(Reason);
+        Res ->
+            ?dbg("~p: call(~p, ~p) -> ~p~n", [self(), A, Req, Res]),
+            Res
+    end.
 
 %% callback functions
 
@@ -192,16 +206,18 @@ init(Opts) ->
 	    ok
     end,
     Client = proplists:get_value(client, Opts),
+    ClientMRef = erlang:monitor(process, Client),
     {ok,#state{
-       locks = [],
-       down = [],
-       monitored = ensure_monitor_(?LOCKER, node(), orddict:new()),
-       pending = [],
-       sync = [],
-       client = Client,
-       abort_on_exit = OnExit,
-       options = Opts,
-       answer = locking}}.
+           locks = [],
+           down = [],
+           monitored = ensure_monitor_(?LOCKER, node(), orddict:new()),
+           pending = [],
+           sync = [],
+           client = Client,
+           client_mref = ClientMRef,
+           abort_on_exit = OnExit,
+           options = Opts,
+           answer = locking}}.
 
 handle_call({lock, Object, Mode, Nodes, Require, Wait} = _Request, {Client, Tag},
             #state{requests = Reqs} = State)
@@ -270,7 +286,7 @@ handle_call(R, _, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(#lock_info{lock = Lock0, where = Node, note = Note} = I, State0) ->
+handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, State0) ->
     ?dbg("~p: handle_info(~p~n", [self(), I]),
     LockID = {Lock0#lock.object, Node},
     Lock = Lock0#lock{object = LockID},
@@ -293,6 +309,8 @@ handle_info(#lock_info{lock = Lock0, where = Node, note = Note} = I, State0) ->
     end;
 handle_info({surrendered, A, OID}, State) ->
     {noreply, note_deadlock(A, OID, State)};
+handle_info({'DOWN', Ref, _, _, _}, #state{client_mref = Ref} = State) ->
+    {stop, normal, State};
 handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
             #state{monitored = Mon,
                    down = Down,
@@ -396,7 +414,7 @@ request_surrender({OID, Node} = LockID, #state{}) ->
 
 check_if_done(#state{pending = []} = State) ->
     State;
-check_if_done(#state{notify = Notify} = State) ->
+check_if_done(#state{} = State) ->
     case waitingfor(State) of
 	[_|_] = _WF ->   % not done
             ?dbg("waitingfor() -> ~p - not done~n", [_WF]),
@@ -405,19 +423,27 @@ check_if_done(#state{notify = Notify} = State) ->
 	    %% _DLs = State#state.deadlocks,
 	    Msg = {have_all_locks, State#state.deadlocks},
 	    ?dbg("~p: have all locks~n", [self()]),
-	    NewNotify =
-		lists:filter(
-		  fun({P, R, events}) ->
-			  P ! {?MODULE, R, Msg},
-			  true;
-		     ({P, R, await_all_locks}) ->
-			  gen_server:reply({P, R}, Msg),
-			  false;
-		     (_) ->
-			  true
-		  end, Notify),
-	    State#state{notify = NewNotify}
+	    notify(Msg, State)
     end.
+
+abort_on_deadlock(OID, State) ->
+    notify({abort, Reason = {deadlock, OID}}, State),
+    error(Reason).
+
+notify(Msg, #state{notify = Notify} = State) ->
+    NewNotify =
+        lists:filter(
+          fun({P, R, events}) ->
+                  P ! {?MODULE, R, Msg},
+                  true;
+             ({P, R, await_all_locks}) ->
+                  gen_server:reply({P, R}, Msg),
+                  false;
+             (_) ->
+                  true
+          end, Notify),
+    State#state{notify = NewNotify}.
+
 %% check_if_done(#state{notify = Notify} = State) ->
 %%     case have_info_on_all_locks(State#state.pending, State#state.locks) of
 %% 	false ->
@@ -483,6 +509,12 @@ handle_locks(#state{locks = Locks, deadlocks = Deadlocks} = State) ->
 	{deadlock,ShouldSurrender,ToObject} ->
 	    ?dbg("~p: deadlock: ShouldSurrender = ~p, ToObject = ~p~n",
 		 [self(), ShouldSurrender, ToObject]),
+            case ShouldSurrender == self() andalso
+                proplists:get_value(
+                  abort_on_deadlock, State#state.options, false) of
+                true -> abort_on_deadlock(ToObject, State);
+                false -> ok
+            end,
 	    %% throw all lock info about this resource away,
 	    %%   since it will change
 	    %% this can be optimized by a foldl resulting in a pair
@@ -514,7 +546,7 @@ send_surrender_info(Agents, #lock{object = OID, queue = Q}) ->
       || A <- Agents -- [E#entry.agent || E <- flatten_queue(Q)]].
 
 send_lockinfo(Agent, #lock{object = {OID, Node}} = L) ->
-    Agent ! #lock_info{lock = L#lock{object = OID}, where = Node}.
+    Agent ! #locks_info{lock = L#lock{object = OID}, where = Node}.
 
 terminate(_Reason, _State) ->
     ok.
