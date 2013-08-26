@@ -1,3 +1,26 @@
+%% -*- mode: erlang; indent-tabs-mode: nil; -*-
+%%---- BEGIN COPYRIGHT -------------------------------------------------------
+%%
+%% Copyright (C) 2013 Ulf Wiger. All rights reserved.
+%%
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at http://mozilla.org/MPL/2.0/.
+%%
+%%---- END COPYRIGHT ---------------------------------------------------------
+%% Key contributor: Thomas Arts <thomas.arts@quviq.com>
+%%
+%%=============================================================================
+%% @doc Official API for the 'locks' system
+%%
+%% This module contains the supported interface functions for
+%%
+%% * starting and stopping a transaction (agent)
+%% * acquiring locks via an agent
+%% * awaiting requested locks
+%%
+%% @end
+
 -module(locks).
 
 -export(

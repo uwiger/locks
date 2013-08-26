@@ -1,64 +1,10 @@
 
 
 # Module locks_agent #
-* [Data Types](#types)
 * [Function Index](#index)
 * [Function Details](#functions)
 
 __Behaviours:__ [`gen_server`](gen_server.md).
-
-<a name="types"></a>
-
-## Data Types ##
-
-
-
-
-### <a name="type-agent">agent()</a> ###
-
-
-
-<pre><code>
-agent() = pid()
-</code></pre>
-
-
-
-
-
-### <a name="type-deadlocks">deadlocks()</a> ###
-
-
-
-<pre><code>
-deadlocks() = [{<a href="#type-agent">agent()</a>, <a href="#type-oid">oid()</a>}]
-</code></pre>
-
-
-
-
-
-### <a name="type-lock_reply">lock_reply()</a> ###
-
-
-
-<pre><code>
-lock_reply() = {<a href="#type-lock_status">lock_status()</a>, <a href="#type-deadlocks">deadlocks()</a>}
-</code></pre>
-
-
-
-
-
-### <a name="type-lock_status">lock_status()</a> ###
-
-
-
-<pre><code>
-lock_status() = have_all_locks | have_none
-</code></pre>
-
-
 <a name="index"></a>
 
 ## Function Index ##
@@ -77,7 +23,7 @@ lock_status() = have_all_locks | have_none
 
 
 <pre><code>
-await_all_locks(Agent::<a href="#type-agent">agent()</a>) -&gt; <a href="#type-lock_reply">lock_reply()</a>
+await_all_locks(Agent::<a href="#type-agent">agent()</a>) -&gt; <a href="#type-lock_result">lock_result()</a>
 </code></pre>
 
 <br></br>
@@ -90,7 +36,7 @@ await_all_locks(Agent::<a href="#type-agent">agent()</a>) -&gt; <a href="#type-l
 
 
 <pre><code>
-begin_transaction(Objects::[<a href="#type-oid">oid()</a> | {<a href="#type-oid">oid()</a>, <a href="#type-mode">mode()</a>} | {<a href="#type-oid">oid()</a>, <a href="#type-mode">mode()</a>, <a href="#type-where">where()</a>}]) -&gt; {<a href="#type-agent">agent()</a>, <a href="#type-lock_reply">lock_reply()</a>}
+begin_transaction(Objects::<a href="#type-objs">objs()</a>) -&gt; {<a href="#type-agent">agent()</a>, <a href="#type-lock_result">lock_result()</a>}
 </code></pre>
 
 <br></br>
@@ -101,7 +47,13 @@ begin_transaction(Objects::[<a href="#type-oid">oid()</a> | {<a href="#type-oid"
 
 ### begin_transaction/2 ###
 
-`begin_transaction(Objects, Opts) -> any()`
+
+<pre><code>
+begin_transaction(Objects::<a href="#type-objs">objs()</a>, Opts::<a href="#type-options">options()</a>) -&gt; {<a href="#type-agent">agent()</a>, <a href="#type-lock_result">lock_result()</a>}
+</code></pre>
+
+<br></br>
+
 
 
 <a name="end_transaction-1"></a>

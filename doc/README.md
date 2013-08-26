@@ -62,6 +62,8 @@ unique top-level key.
 While it is possible to use the `locks_server` API directly to lock single
 objects, distributed locking and deadlock detection is done by `locks_agent`.
 
+The official API to use is `locks`.
+
 Agents are started e.g. using `locks_agent:begin_transaction(...)`, and are
 separate state machines (processes). The `locks_server` informs agents via
 `#locks_info{}` messages (containing not only the ID of the agent that holds
@@ -79,7 +81,7 @@ of the transaction.
 
 ## Distributed locking ##
 
-Using the function `locks_agent:lock(Agent, LockID, Mode, Nodes, Req)`, a lock
+Using the function `locks:lock(Agent, LockID, Mode, Nodes, Req)`, a lock
 can be acquired on several nodes at once.
 
 ```erlang
@@ -98,6 +100,7 @@ few lock servers are available to fulfill the lock requirement, it will abort.
 
 
 <table width="100%" border="0" summary="list of modules">
+<tr><td><a href="locks.md" class="module">locks</a></td></tr>
 <tr><td><a href="locks_agent.md" class="module">locks_agent</a></td></tr>
 <tr><td><a href="locks_server.md" class="module">locks_server</a></td></tr></table>
 
