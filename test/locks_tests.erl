@@ -22,33 +22,37 @@ run_test_() ->
     {setup,
      fun() -> application:start(locks) end,
      fun(_) -> application:stop(locks) end,
-     [
-      ?_test(simple_lock())
-      , ?_test(one_lock_two_clients())
-      , ?_test(two_clients_direct_deadlock())
-      , ?_test(three_clients_deadlock())
-      , ?_test(two_clients_hierarchical_deadlock())
-      , ?_test(two_clients_abort_on_deadlock())
-      , {setup,
-         fun() ->
-                 start_slaves([locks_1, locks_2]),
-                 Nodes = nodes(),
-                 io:fwrite(user, "Nodes = ~p~n", [Nodes]),
-                 rpc:multicall(Nodes, application, start, [locks]),
-                 Nodes
-         end,
-         fun(_Ns) ->
-                 ok
-         end,
-         fun(Ns) ->
-                 {inorder,
-                  [
-                   ?_test(d_simple_lock_all(Ns))
-                   , ?_test(d_simple_lock_majority(Ns))
-                   , ?_test(d_simple_lock_any(Ns))
-                  ]}
-         end}
-     ]}.
+     {inorder,
+      [
+       ?_test(simple_lock())
+       , ?_test(one_lock_two_clients())
+       , ?_test(lock_upgrade1())
+       , ?_test(lock_upgrade2())
+       , ?_test(two_clients_direct_deadlock())
+       , ?_test(three_clients_deadlock())
+       , ?_test(two_clients_hierarchical_deadlock())
+       , ?_test(two_clients_abort_on_deadlock())
+       , {setup,
+          fun() ->
+                  start_slaves([locks_1, locks_2]),
+                  Nodes = nodes(),
+                  io:fwrite(user, "Nodes = ~p~n", [Nodes]),
+                  rpc:multicall(Nodes, application, start, [locks]),
+                  Nodes
+          end,
+          fun(_Ns) ->
+                  ok
+          end,
+          fun(Ns) ->
+                  {inorder,
+                   [
+                    ?_test(d_simple_lock_all(Ns))
+                    , ?_test(d_simple_lock_majority(Ns))
+                    , ?_test(d_simple_lock_any(Ns))
+                   ]}
+          end}
+      ]}
+    }.
 
 
 simple_lock() ->
@@ -60,11 +64,32 @@ simple_lock() ->
 one_lock_two_clients() ->
     script([1,2],
            [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
-            {2, ?LINE, locks, lock, ['$agent', [a]], 100, match(timeout, timeout)},
+            {2, ?LINE, locks, lock, ['$agent', [a]], 100,
+             match(timeout, timeout)},
             {2, ?LINE, ?MODULE, client_waits, [], match(true)},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+lock_upgrade1() ->
+    script([1,2],
+           [{1, ?LINE, locks, lock, ['$agent', [a], read], match({ok, []})},
+            {1, ?LINE, locks, lock, ['$agent', [a], write], match({ok, []})},
+            {2, ?LINE, locks, lock, ['$agent', [a,1],read], 100,
+             match(timeout, timeout)},
+            {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
+            {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+lock_upgrade2() ->
+    script([1,2],
+           [{1, ?LINE, locks, lock, ['$agent', [a], read], match({ok, []})},
+            {2, ?LINE, locks, lock, ['$agent', [a,1], read], match({ok,[]})},
+            {1, ?LINE, locks, lock, ['$agent', [a], write], 100,
+             match(timeout, timeout)},
+            {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {1, ?LINE, ?MODULE, client_result, [], match({ok, []})},
+            {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_direct_deadlock() ->
     script([1,2],
@@ -155,7 +180,10 @@ d_simple_lock_any(Ns) ->
 
 script(Agents, S) ->
     AgentPids = [spawn_agent(A) || A <- Agents],
-    eval_script(S, AgentPids).
+    try eval_script(S, AgentPids)
+    after
+        [kill_client(C) || {_, C, _} <- AgentPids]
+    end.
 
 spawn_agent(A) when is_atom(A); is_integer(A) ->
     {ok, Pid} = spawn_client(),

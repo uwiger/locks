@@ -242,7 +242,9 @@ do_remove_agent_([{A, ID}|T], Locks, Acc) ->
 	    do_remove_agent_(T, Locks, Acc);
 	[#lock{version = V, queue = Q} = L] ->
 	    Q1 = lists:foldr(
-		   fun(#r{entries = Es}, Acc1) ->
+		   fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
+			   Acc1;
+		      (#r{entries = Es}, Acc1) ->
 			   [#r{entries = lists:keydelete(A, #entry.agent, Es)}
 			    | Acc1];
 		      (#w{entry = #entry{agent = Ax}}, Acc1) when Ax == A ->
@@ -367,6 +369,12 @@ into_queue(write, [#r{entries = [Er]} = H], Entry) ->
        true ->
 	    [H, #w{entry = Entry}]
     end;
+into_queue(write, [#r{entries = Es} = H|T], #entry{agent = A} = Entry) ->
+    H1 = case lists:keymember(A, #entry.agent, Es) of
+	     true -> H#r{entries = lists:keydelete(A, #entry.agent, Es)};
+	     false -> H
+	 end,
+    [H1 | into_queue(write, T, Entry)];
 into_queue(Type, [H|T] = Q, Entry) ->
     case in_queue_(H, Entry#entry.agent, Type) of
 	false ->

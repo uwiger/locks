@@ -60,19 +60,20 @@
               require = all}).
 
 -record(state, {
-          locks = []     :: [#lock{}],
-          requests = []  :: [#req{}],
-          down = []      :: [node()],
-          monitored = [] :: [{node(), reference()}],
-          pending = []   :: [lock_id()],
-          sync = []      :: [#lock{}],
-          client         :: pid(),
-          client_mref    :: reference(),
-          options = []   :: [option()],
+          locks = []       :: [#lock{}],
+          requests = []    :: [#req{}],
+          down = []        :: [node()],
+          monitored = []   :: [{node(), reference()}],
+          pending = []     :: [lock_id()],
+          sync = []        :: [#lock{}],
+          client           :: pid(),
+          client_mref      :: reference(),
+          options = []     :: [option()],
           abort_on_exit = true :: boolean(),
-          notify = []    :: [{pid(), reference(), notify_type()}],
-          answer         :: locking | waiting | done,
-          deadlocks = [] :: deadlocks()
+          notify = []      :: [{pid(), reference(), notify_type()}],
+          answer           :: locking | waiting | done,
+          deadlocks = []   :: deadlocks(),
+          have_all = false :: boolean()
          }).
 
 -define(myclient,State#state.client).
@@ -278,22 +279,29 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
             #state{requests = Reqs} = State)
   when Client==?myclient ->
     ?dbg("~p: Req = ~p~n", [self(), _Request]),
-    case lists:keyfind(Object, 1, Reqs) of
+    case lists:keyfind(Object, #req.object, Reqs) of
         false ->
-            Req = #req{object = Object,
-                       mode = Mode,
-                       nodes = Nodes,
-                       require = Require},
-            S1 = lists:foldl(
-                   fun(Node, Sx) ->
-                           OID = {Object, Node},
-                           request_lock(
-                             OID, Mode, ensure_monitor(Node, Sx))
-                   end, State#state{requests = [Req|Reqs]}, Nodes),
+            ?dbg("~p: no previous request for ~p~n", [self(), Object]),
+            S1 = new_request(Object, Mode, Nodes, Require, State),
             maybe_reply(Wait, Client, Tag, S1);
-        #req{nodes = Nodes, require = Require} ->
+        #req{nodes = Nodes, require = Require, mode = Mode} ->
+            ?dbg("~p: repeated request for ~p~n", [self(), Object]),
             %% Repeated request
             maybe_reply(Wait, Client, Tag, State);
+        #req{nodes = Nodes, require = Require, mode = write} when Mode==read ->
+            ?dbg("~p: found old request for write lock on ~p~n", [self(),
+                                                                  Object]),
+            %% The old request is sufficient
+            maybe_reply(Wait, Client, Tag, State);
+        #req{nodes = Nodes, require = Require, mode = read} when Mode==write ->
+            ?dbg("~p: need to upgrade existing read lock on ~p~n",
+                 [self(), Object]),
+            NewLocks = [L || #lock{object = OID} = L <- State#state.locks,
+                             element(1, OID) =/= Object],
+            ?dbg("~p: Remove old lock info on ~p~n", [self(), Object]),
+            S1 = new_request(Object, Mode, Nodes, Require,
+                             State#state{locks = NewLocks}),
+            maybe_reply(Wait, Client, Tag, S1);
         #req{nodes = PrevNodes} ->
             %% Different conditions from last time
             Reason = {conflicting_request,
@@ -302,6 +310,19 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
     end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+new_request(Object, Mode, Nodes, Require, #state{requests = Reqs} = State) ->
+    Req = #req{object = Object,
+               mode = Mode,
+               nodes = Nodes,
+               require = Require},
+    lists:foldl(
+      fun(Node, Sx) ->
+              OID = {Object, Node},
+              request_lock(
+                OID, Mode, ensure_monitor(Node, Sx))
+      end, State#state{requests = [Req|Reqs]}, Nodes).
+
 
 %% @private
 handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = _I, State0) ->
@@ -434,17 +455,17 @@ request_surrender({OID, Node} = _LockID, #state{}) ->
     locks_server:surrender(OID, Node).
 
 check_if_done(#state{pending = []} = State) ->
-    State;
+    State#state{have_all = true};
 check_if_done(#state{} = State) ->
     case waitingfor(State) of
 	[_|_] = _WF ->   % not done
-            ?dbg("waitingfor() -> ~p - not done~n", [_WF]),
-	    State;
+            ?dbg("~p: waitingfor() -> ~p - not done~n", [self(), _WF]),
+	    State#state{have_all = false};
 	[] ->
 	    %% _DLs = State#state.deadlocks,
 	    Msg = {have_all_locks, State#state.deadlocks},
 	    ?dbg("~p: have all locks~n", [self()]),
-	    notify(Msg, State)
+	    notify(Msg, State#state{have_all = true})
     end.
 
 abort_on_deadlock(OID, State) ->
@@ -465,7 +486,10 @@ notify(Msg, #state{notify = Notify} = State) ->
           end, Notify),
     State#state{notify = NewNotify}.
 
-
+handle_locks(#state{have_all = true} = State) ->
+    %% If we have all locks we've asked for, no need to search for potential
+    %% deadlocks - reasonably, we cannot be involved in one.
+    State;
 handle_locks(#state{locks = Locks, deadlocks = Deadlocks} = State) ->
     InvolvedAgents =
         uniq( lists:flatmap(
@@ -608,7 +632,7 @@ waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs}) ->
              (_, Acc) ->
                   Acc
           end, Pending, Reqs),
-    ?dbg("HaveLocks = ~p~n", [HaveLocks]),
+    ?dbg("~p: HaveLocks = ~p~n", [self(), HaveLocks]),
     PendingTrimmed -- HaveLocks.
 
 i_add_lock(#state{locks = Locks, sync = Sync} = State,
