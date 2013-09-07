@@ -10,7 +10,7 @@ __Behaviours:__ [`gen_server`](gen_server.md).
 ## Function Index ##
 
 
-<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#await_all_locks-1">await_all_locks/1</a></td><td></td></tr><tr><td valign="top"><a href="#begin_transaction-1">begin_transaction/1</a></td><td></td></tr><tr><td valign="top"><a href="#begin_transaction-2">begin_transaction/2</a></td><td></td></tr><tr><td valign="top"><a href="#end_transaction-1">end_transaction/1</a></td><td></td></tr><tr><td valign="top"><a href="#lock-2">lock/2</a></td><td></td></tr><tr><td valign="top"><a href="#lock-3">lock/3</a></td><td>Equivalent to <a href="#lock-6"><tt>lock(Agent, Obj, Mode, [node()], all, wait)</tt></a>.</td></tr><tr><td valign="top"><a href="#lock-4">lock/4</a></td><td></td></tr><tr><td valign="top"><a href="#lock-5">lock/5</a></td><td></td></tr><tr><td valign="top"><a href="#lock_info-1">lock_info/1</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-2">lock_nowait/2</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-3">lock_nowait/3</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-4">lock_nowait/4</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-5">lock_nowait/5</a></td><td></td></tr><tr><td valign="top"><a href="#lock_objects-2">lock_objects/2</a></td><td></td></tr><tr><td valign="top"><a href="#start-1">start/1</a></td><td></td></tr><tr><td valign="top"><a href="#start_link-0">start_link/0</a></td><td></td></tr><tr><td valign="top"><a href="#start_link-1">start_link/1</a></td><td></td></tr></table>
+<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#await_all_locks-1">await_all_locks/1</a></td><td></td></tr><tr><td valign="top"><a href="#begin_transaction-1">begin_transaction/1</a></td><td></td></tr><tr><td valign="top"><a href="#begin_transaction-2">begin_transaction/2</a></td><td></td></tr><tr><td valign="top"><a href="#change_flag-3">change_flag/3</a></td><td></td></tr><tr><td valign="top"><a href="#end_transaction-1">end_transaction/1</a></td><td></td></tr><tr><td valign="top"><a href="#lock-2">lock/2</a></td><td></td></tr><tr><td valign="top"><a href="#lock-3">lock/3</a></td><td>Equivalent to <a href="#lock-6"><tt>lock(Agent, Obj, Mode, [node()], all, wait)</tt></a>.</td></tr><tr><td valign="top"><a href="#lock-4">lock/4</a></td><td></td></tr><tr><td valign="top"><a href="#lock-5">lock/5</a></td><td></td></tr><tr><td valign="top"><a href="#lock_info-1">lock_info/1</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-2">lock_nowait/2</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-3">lock_nowait/3</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-4">lock_nowait/4</a></td><td></td></tr><tr><td valign="top"><a href="#lock_nowait-5">lock_nowait/5</a></td><td></td></tr><tr><td valign="top"><a href="#lock_objects-2">lock_objects/2</a></td><td></td></tr><tr><td valign="top"><a href="#start-1">start/1</a></td><td></td></tr><tr><td valign="top"><a href="#start_link-0">start_link/0</a></td><td></td></tr><tr><td valign="top"><a href="#start_link-1">start_link/1</a></td><td></td></tr></table>
 
 
 <a name="functions"></a>
@@ -54,6 +54,13 @@ begin_transaction(Objects::<a href="#type-objs">objs()</a>, Opts::<a href="#type
 
 <br></br>
 
+
+
+<a name="change_flag-3"></a>
+
+### change_flag/3 ###
+
+`change_flag(Agent, Option, Bool) -> any()`
 
 
 <a name="end_transaction-1"></a>

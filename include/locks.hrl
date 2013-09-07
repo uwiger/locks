@@ -55,10 +55,12 @@
 	 }).
 
 -record(lock, {
-	  object = []  :: oid() | lock_id() | '_',
-	  version = 1  :: integer()     | '_',
-	  pid = self() :: pid()         | '_',
-	  queue = []   :: [#r{} | #w{}] | '_'}).
+	  object = []    :: oid() | lock_id() | '_',
+	  version = 1    :: integer()     | '_',
+	  pid = self()   :: pid()         | '_',
+	  queue = []     :: [#r{} | #w{}] | '_',
+	  watchers = [] :: [pid()]
+         }).
 
 -record(locks_info, {
 	  lock,

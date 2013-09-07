@@ -61,6 +61,10 @@ begin_transaction(Objects) ->
 %%   agents will abort if a deadlock is detected.
 %% * `{client, pid()}' - defaults to `self()'. The agent will accept lock
 %%   requests only from the designated client.
+%% * `{await_nodes, boolean()}' - default: `false'. If nodes required to
+%%   serve a lock request are off-line, with `{await_nodes, false}', the
+%%   transaction will abort; with `{await_nodes, true}' the transaction will
+%%   wait for them to return and try to re-acquire the locks.
 %%
 %% @end
 begin_transaction(Objects, Options) when is_list(Objects), is_list(Options) ->

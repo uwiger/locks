@@ -16,6 +16,8 @@
 
 -behaviour(gen_server).
 
+-compile({parse_transform, locks_watcher}).
+
 -export([start_link/0, start_link/1, start/1]).
 -export([begin_transaction/1,
 	 begin_transaction/2,
@@ -24,6 +26,7 @@
          lock_nowait/2, lock_nowait/3, lock_nowait/4, lock_nowait/5,
 	 lock_objects/2,
 	 await_all_locks/1,
+         change_flag/3,
 	 lock_info/1,
          %%	 await_all_or_none/1,
 	 end_transaction/1]).
@@ -48,11 +51,9 @@
 -define(dbg(F, A), ok).
 -endif.
 
--type notify_type() :: await_all_locks
-                       %%		     | await_all_or_none
-		     | events.
 -type option()      :: {client, pid()}
-                     | {abort_on_exit, boolean()}.
+                     | {abort_on_deadlock, boolean()}
+                     | {await_nodes, boolean()}.
 
 -record(req, {object,
               mode,
@@ -64,13 +65,14 @@
           requests = []    :: [#req{}],
           down = []        :: [node()],
           monitored = []   :: [{node(), reference()}],
+          await_nodes = false :: boolean(),
           pending = []     :: [lock_id()],
           sync = []        :: [#lock{}],
           client           :: pid(),
           client_mref      :: reference(),
           options = []     :: [option()],
-          abort_on_exit = true :: boolean(),
-          notify = []      :: [{pid(), reference(), notify_type()}],
+          notify = []      :: [{pid(), reference(), await_all_locks}
+                               | {pid(), events}],
           answer           :: locking | waiting | done,
           deadlocks = []   :: deadlocks(),
           have_all = false :: boolean()
@@ -139,7 +141,8 @@ lock(Agent, [_|_] = Obj, Mode, [_|_] = Where) ->
 %%
 lock(Agent, [_|_] = Obj, Mode, [_|_] = Where, R)
   when is_pid(Agent) andalso (Mode == read orelse Mode == write)
-       andalso (R == all orelse R == any orelse R == majority) ->
+       andalso (R == all orelse R == any orelse R == majority
+                orelse R == majority_alive) ->
     lock_(Agent, Obj, Mode, Where, R, wait).
 
 lock_(Agent, Obj, Mode, Where, R, Wait) ->
@@ -155,6 +158,11 @@ lock_(Agent, Obj, Mode, Where, R, Wait) ->
         false ->
             error({invalid_nodes, Where})
     end.
+
+change_flag(Agent, Option, Bool)
+  when is_boolean(Bool), Option == abort_on_deadlock;
+       is_boolean(Bool), Option == await_nodes ->
+    gen_server:cast(Agent, {option, Option, Bool}).
 
 cast(Agent, Msg, Ref) ->
     gen_server:cast(Agent, Msg),
@@ -196,7 +204,8 @@ lock_objects(Agent, Objects) ->
                         when (Mode == read orelse Mode == write)
                              andalso (Req == all
                                       orelse Req == any
-                                      orelse Req == majority) ->
+                                      orelse Req == majority
+                                      orelse Req == majority_alive) ->
                           lock_nowait(Agent, Obj, Mode, Where);
                      (L) ->
                           error({illegal_lock_pattern, L})
@@ -222,23 +231,24 @@ call(A, Req, Timeout) ->
 
 %% @private
 init(Opts) ->
-    case OnExit = proplists:get_value(abort_on_exit, Opts, true) of
-	false ->
-	    process_flag(trap_exit, true);
-	true ->
-	    ok
-    end,
     Client = proplists:get_value(client, Opts),
     ClientMRef = erlang:monitor(process, Client),
+    Notify = case proplists:get_value(notify, Opts, false) of
+                 true -> [{Client, events}];
+                 false -> []
+             end,
+    AwaitNodes = proplists:get_value(await_nodes, Opts, false),
+    net_kernel:monitor_nodes(true),
     {ok,#state{
            locks = [],
            down = [],
            monitored = ensure_monitor_(?LOCKER, node(), orddict:new()),
+           await_nodes = AwaitNodes,
            pending = [],
            sync = [],
            client = Client,
            client_mref = ClientMRef,
-           abort_on_exit = OnExit,
+           notify = Notify,
            options = Opts,
            answer = locking}}.
 
@@ -308,6 +318,14 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
                       [Object, Nodes, PrevNodes]},
             {stop, Reason, {error, Reason}, State}
     end;
+handle_cast({option, O, Val}, #state{options = Opts} = S) ->
+    S1 = case O of
+             await_nodes ->
+                 S#state{await_nodes = Val};
+             _ ->
+                 S#state{options = lists:keystore(O, 1, Opts, {O, Val})}
+         end,
+    {noreply, S1};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -361,17 +379,57 @@ handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
         [] ->
             {noreply, S#state{down = lists:keydelete(Node, 1, Mon)}};
         Objs ->
-            case [O || O <- Objs,
-                       request_can_be_served(O, S) =:= false] of
-                [] ->
-                    {noreply, S1};
-                Lost ->
-                    {stop, {cannot_lock_objects, Lost}, S1}
+            case S1#state.await_nodes of
+                false ->
+                    case [O || O <- Objs,
+                               request_can_be_served(O, S1) =:= false] of
+                        [] ->
+                            {noreply, S1};
+                        Lost ->
+                            {stop, {cannot_lock_objects, Lost}, S1}
+                    end;
+                true ->
+                    case lists:member(Node, nodes()) of
+                        true  -> watch_node(Node);
+                        false -> ignore
+                    end,
+                    {noreply, S1}
             end
+    end;
+handle_info({'DOWN',_,_,_,_}, S) ->
+    %% most likely a watcher
+    {noreply, S};
+handle_info({nodeup, N}, #state{down = Down} = S) ->
+    case lists:member(N, Down) of
+        true  -> watch_node(N);
+        false -> ignore
+    end,
+    {noreply, S};
+handle_info({nodedown,_}, S) ->
+    %% We react on 'DOWN' messages above instead
+    {noreply, S};
+handle_info({locks_running,N}, #state{down = Down, requests = Reqs} = S) ->
+    case lists:member(N, Down) of
+        true ->
+            case [{O,M} || #req{nodes = Ns, object = O, mode = M} <- Reqs,
+                           lists:member(N, Ns)] of
+                [] ->
+                    {noreply, S#state{down = Down -- [N]}};
+                Reissue ->
+                    S1 = lists:foldl(
+                           fun({Obj,Mode}, Sx) ->
+                                   request_lock(
+                                     {Obj,N}, Mode, Sx)
+                           end, ensure_monitor(N, S), Reissue),
+                    {noreply, S1}
+            end;
+        false ->
+            {noreply, S}
     end;
 handle_info({'EXIT', Client, Reason}, #state{client = Client} = S) ->
     {stop, Reason, S};
-handle_info(_, State) ->
+handle_info(_Msg, State) ->
+    io:fwrite("Unknown msg: ~p~n", [_Msg]),
     {noreply,State}.
 
 maybe_reply(nowait, _, _, State) ->
@@ -396,18 +454,27 @@ await_all_locks_(Client, Tag, State) ->
             {stop, {error, Reason}, State}
     end.
 
+request_can_be_served(_, #state{await_nodes = true}) ->
+    true;
 request_can_be_served(Obj, #state{down = Down, requests = Reqs}) ->
     case lists:keyfind(Obj, #req.object, Reqs) of
         #req{nodes = Ns, require = R} ->
             case R of
                 all      -> intersection(Down, Ns) == [];
                 any      -> Ns -- Down =/= [];
-                majority -> length(Ns -- Down) >= (length(Ns) div 2)
+                majority -> length(Ns -- Down) >= (length(Ns) div 2);
+                majority_alive ->
+                    true
             end;
         false ->
             false
     end.
 
+watch_node(N) ->
+    {M, F, A} =
+        locks_watcher(self()),  % expanded through parse_transform
+    P = spawn(N, M, F, A),
+    erlang:monitor(process, P).
 
 check_note([], _, State) ->
     State;
@@ -475,8 +542,8 @@ abort_on_deadlock(OID, State) ->
 notify(Msg, #state{notify = Notify} = State) ->
     NewNotify =
         lists:filter(
-          fun({P, R, events}) ->
-                  P ! {?MODULE, R, Msg},
+          fun({P, events}) ->
+                  P ! {?MODULE, self(), Msg},
                   true;
              ({P, R, await_all_locks}) ->
                   gen_server:reply({P, R}, Msg),
@@ -610,7 +677,8 @@ waiting_for_ack(#state{sync = Sync}, LockID) ->
     lists:member(LockID, Sync).
 
 -spec waitingfor(#state{}) -> [lock_id()].
-waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs}) ->
+waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs,
+                  down = Down}) ->
     HaveLocks = [L#lock.object || L <- Locks,
                                   in(self(), hd(L#lock.queue))],
     PendingTrimmed =
@@ -618,6 +686,15 @@ waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs}) ->
           fun(#req{object = OID, require = majority, nodes = Ns}, Acc) ->
                   NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
                   case length(NodesLocked) >= (length(Ns) div 2) of
+                      true ->
+                          [ID || {O,_} = ID <- Acc, O =/= OID];
+                      false ->
+                          Acc
+                  end;
+             (#req{object = OID, require = majority_alive, nodes = Ns}, Acc) ->
+                  Alive = Ns -- Down,
+                  NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
+                  case length(NodesLocked) >= (length(Alive) div 2) of
                       true ->
                           [ID || {O,_} = ID <- Acc, O =/= OID];
                       false ->
@@ -743,3 +820,4 @@ max_agent([{A1, O1}, {A2, _O2} | Rest]) when A1 > A2 ->
     max_agent([{A1, O1} | Rest]);
 max_agent([{_A1, _O1}, {A2, O2} | Rest]) ->
     max_agent([{A2, O2} | Rest]).
+

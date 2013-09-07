@@ -16,6 +16,7 @@
 
 -export([lock/2, lock/3, lock/4,
 	 surrender/2, surrender/3,
+	 watch/2, unwatch/2,
 	 remove_agent/1, remove_agent/2]).
 
 -export([start_link/0,
@@ -43,6 +44,7 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
+    catch locks_watcher ! locks_running,
     {ok, #st{}}.
 
 lock(LockID, Mode) when Mode==read; Mode==write ->
@@ -59,6 +61,16 @@ lock(LockID, Nodes, TID, Mode)
 
 lock_(LockID, Nodes, TID, Mode) when is_list(LockID), is_list(Nodes) ->
     Msg = {lock, LockID, TID, Mode},
+    _ = [cast({?LOCKER, N}, Msg) || N <- Nodes],
+    ok.
+
+watch(LockID, Nodes) ->
+    Msg = {watch, LockID, self()},
+    _ = [cast({?LOCKER, N}, Msg) || N <- Nodes],
+    ok.
+
+unwatch(LockID, Nodes) ->
+    Msg = {unwatch, LockID, self()},
     _ = [cast({?LOCKER, N}, Msg) || N <- Nodes],
     ok.
 
@@ -99,6 +111,12 @@ handle_cast({remove_agent, Agent}, #st{tabs = Tabs} = S) ->
     Updated = do_remove_agent(Agent, Tabs),
     notify(Updated, S#st.notify_as),
     {noreply, demonitor_agent(Agent, S)};
+handle_cast({watch, LockID, Pid}, #st{tabs = Tabs} = S) ->
+    insert_watcher(LockID, Pid, Tabs),
+    {noreply, monitor_agent(Pid, S)};
+handle_cast({unwatch, LockID, Pid}, #st{tabs = Tabs} = S) ->
+    delete_watcher(LockID, Pid, Tabs),
+    {noreply, S};
 handle_cast(_, S) ->
     {noreply, S}.
 
@@ -124,9 +142,10 @@ code_change(_FromVsn, S, _Extra) ->
 notify(Locks, Me) ->
     notify(Locks, Me, []).
 
-notify([#lock{queue = Q} = H|T], Me, Note) ->
-    _ = [send(A, #locks_info{lock = H, note = Note})
-	 || #entry{agent = A} <- queue_entries(Q)],
+notify([#lock{queue = Q, watchers = W} = H|T], Me, Note) ->
+    Msg = #locks_info{lock = H, note = Note},
+    _ = [send(A, Msg) || #entry{agent = A} <- queue_entries(Q)],
+    _ = [send(P, Msg) || P <- W],
     notify(T, Me, Note);
 notify([], _, _) ->
     ok.
@@ -151,6 +170,30 @@ insert(ID, Tid, Mode, {Locks, Tids})
     check_tids(Check, ID, Tid, Result, Tids),
     ets:insert(Locks, Result),
     Result.
+
+insert_watcher(ID, Pid, {Locks, Tids}) ->
+    case ets:lookup(Locks, ID) of
+	[#lock{queue = Q, watchers = Ws} = L] ->
+	    L1 = L#lock{watchers = [Pid | Ws -- [Pid]]},
+	    if Q == [] -> ok;
+	       true ->
+                    %% send first notification if lock held
+                    Pid ! #locks_info{lock = ID}
+	    end,
+	    ets:insert(Locks, L1);
+	[] ->
+	    ets:insert(Locks, #lock{object = ID, watchers = [Pid]})
+    end,
+    ets:insert(Tids, {Pid, ID}).
+
+delete_watcher(ID, Pid, {Locks, Tids}) ->
+    case ets:lookup(Locks, ID) of
+	[#lock{watchers = Ws} = L] ->
+	    ets:insert(Locks, L#lock{watchers = Ws -- [Pid]}),
+	    ets:delete_object(Tids, {Pid, ID});
+	[] ->
+	    ok
+    end.
 
 check_tids(false, _, _, _, _) ->
     false;
@@ -240,7 +283,7 @@ do_remove_agent_([{A, ID}|T], Locks, Acc) ->
     case ets:lookup(Locks, ID) of
 	[] ->
 	    do_remove_agent_(T, Locks, Acc);
-	[#lock{version = V, queue = Q} = L] ->
+	[#lock{version = V, queue = Q, watchers = Ws} = L] ->
 	    Q1 = lists:foldr(
 		   fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
 			   Acc1;
@@ -252,15 +295,18 @@ do_remove_agent_([{A, ID}|T], Locks, Acc) ->
 		      (E, Acc1) ->
 			   [E|Acc1]
 		   end, [], Q),
-	    if Q1 == [] ->
+	    if Q1 == [], Ws == [] ->
 		    ets:delete(Locks, ID);
 	       true ->
 		    ok
 	    end,
-	    do_remove_agent_(T, Locks, [L#lock{version = V+1, queue = Q1}|Acc])
+	    do_remove_agent_(T, Locks, [L#lock{version = V+1, queue = Q1,
+					       watchers = Ws -- [A]}|Acc])
     end;
 do_remove_agent_([], Locks, Acc) ->
-    ets:insert(Locks, [L || #lock{queue = Q} = L <- Acc, Q =/= []]),
+    ets:insert(Locks, [L || #lock{queue = Q,
+				  watchers = Ws} = L <- Acc,
+			    Q =/= [] orelse Ws =/= []]),
     Acc.
 
 related_locks(ID, T) ->
