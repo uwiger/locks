@@ -12,9 +12,13 @@ parse_transform(Forms, _) ->
 %% This is the logic that needs to be abstracted and inserted in place of
 %% a (pseudo-)call to locks_watcher(self()).
 %%
-%% The parse transform extracts the top-most fun clauses and passes them to
-%% erl_eval:exprs(). Local calls are inlined and 'anonymized' as
+%% The parse transform extracts the function body (only one clause) of the
+%% locks_watcher/1 function and passes them to erl_eval:exprs().
+%% Local calls are inlined and 'anonymized' as
 %% (fun(A1,..., An) -> ... end)(A1, ..., An)
+%%
+%% Variable names are fetched from the function head, so no pattern-matching
+%% in the head.
 locks_watcher(Agent) ->
     case whereis(locks_server) of
 	undefined ->
@@ -68,11 +72,16 @@ transform([{call,L,{atom,L,locks_watcher},Args}|T]) ->
     Form =
 	case length(Vars) of
 	    Arity ->
+		%% We must create an abstract representation of the
+		%% bindings list.
 		Bindings = mk_cons(
 			     lists:zipwith(
 			       fun(A, B) ->
 				       {tuple,L,[A,B]}
 			       end, [{atom,L,V} || V <- Vars], Args), L),
+		%% The actual call to erl_eval:exprts(Exprs) must be in
+		%% abstract form, but Exprs must be abstract abstract form,
+		%% since it shall be abstract at run-time.
 		{tuple,L,[{atom,L,erl_eval},
 			  {atom,L,exprs},
 			  {cons,L,
@@ -104,17 +113,8 @@ get_exprs(Function, Arity) ->
     [Clauses] = [Cs || {function,_,F,A,Cs} <- Forms,
 	  F =:= Function, A =:= Arity],
     [{clause,_,Vars,[], Body}] = Clauses,
-    VarNames = var_names(Vars),
+    VarNames = lists:map(fun({var,_,V}) -> V end, Vars),
     {VarNames, inline(Body, Forms)}.
-
-var_names([{var,_,V}|T]) ->
-    [V|var_names(T)];
-var_names([{match,_,{var,_,V},_}|T]) ->
-    [V|var_names(T)];
-var_names([{match,_,_,{var,_,V}}|T]) ->
-    [V|var_names(T)];
-var_names([]) ->
-    [].
 
 inline([{call,L,{atom,_,F},Args}|T], Fs) ->
     Arity = length(Args),
