@@ -42,6 +42,7 @@
 
 -record(entry, {
 	  agent         :: pid(),
+          client        :: pid(),
 	  version = 0   :: integer(),
 	  type = direct :: locktype()
 	 }).

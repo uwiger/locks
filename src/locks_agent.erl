@@ -45,7 +45,7 @@
 
 -include("locks.hrl").
 
--ifdef(TEST).
+-ifdef(DEBUG).
 -define(dbg(Fmt, Args), io:fwrite(user, Fmt, Args)).
 -else.
 -define(dbg(F, A), ok).
@@ -89,6 +89,10 @@ start_link(Options) when is_list(Options) ->
     start(lists:keystore(link, 1, Options, {link, true})).
 
 start(Options0) when is_list(Options0) ->
+    case whereis(locks_server) of
+        undefined -> error({not_running, locks_server});
+        _ -> ok
+    end,
     Options =
 	case lists:keymember(client, 1, Options0) of
 	    true -> Options0;
@@ -294,10 +298,17 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
             ?dbg("~p: no previous request for ~p~n", [self(), Object]),
             S1 = new_request(Object, Mode, Nodes, Require, State),
             maybe_reply(Wait, Client, Tag, S1);
-        #req{nodes = Nodes, require = Require, mode = Mode} ->
+        #req{nodes = Nodes1, require = Require, mode = Mode} = Req ->
             ?dbg("~p: repeated request for ~p~n", [self(), Object]),
             %% Repeated request
-            maybe_reply(Wait, Client, Tag, State);
+            case Nodes -- Nodes1 of
+                [] ->
+                    %% no new nodes
+                    maybe_reply(Wait, Client, Tag, State);
+                [_|_] = New ->
+                    S1 = add_nodes(New, Req, State),
+                    maybe_reply(Wait, Client, Tag, S1)
+            end;
         #req{nodes = Nodes, require = Require, mode = write} when Mode==read ->
             ?dbg("~p: found old request for write lock on ~p~n", [self(),
                                                                   Object]),
@@ -341,13 +352,28 @@ new_request(Object, Mode, Nodes, Require, #state{requests = Reqs} = State) ->
                 OID, Mode, ensure_monitor(Node, Sx))
       end, State#state{requests = [Req|Reqs]}, Nodes).
 
+add_nodes(Nodes, #req{object = Object, mode = Mode, nodes = OldNodes} = Req,
+          #state{requests = Reqs} = State) ->
+    AllNodes = union(Nodes, OldNodes),
+    Req1 = Req#req{nodes = AllNodes},
+    lists:foldl(
+      fun(Node, Sx) ->
+              OID = {Object, Node},
+              request_lock(
+                OID, Mode, ensure_monitor(Node, Sx))
+      end, State#state{requests =
+                           lists:keyreplace(
+                             Object, #req.object, Reqs, Req1)}, Nodes).
+
+union(A, B) ->
+    A ++ (B -- A).
 
 %% @private
-handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = _I, State0) ->
+handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, S0) ->
     ?dbg("~p: handle_info(~p~n", [self(), _I]),
     LockID = {Lock0#lock.object, Node},
     Lock = Lock0#lock{object = LockID},
-    State = check_note(Note, LockID, State0),
+    State = check_note(Note, LockID, S0),
     case outdated(State, Lock) orelse waiting_for_ack(State, LockID) of
 	true ->
             ?dbg("~p: outdated or waiting for ack~n"
@@ -361,7 +387,7 @@ handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = _I, State0) -
 		[] ->
 		    {noreply, handle_locks(NewState)};
 		_ ->
-		    {noreply, handle_locks(check_if_done(NewState))}
+		    {noreply, handle_locks(check_if_done(NewState, [I]))}
 	    end
     end;
 handle_info({surrendered, A, OID}, State) ->
@@ -369,32 +395,11 @@ handle_info({surrendered, A, OID}, State) ->
 handle_info({'DOWN', Ref, _, _, _}, #state{client_mref = Ref} = State) ->
     {stop, normal, State};
 handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
-            #state{monitored = Mon,
-                   down = Down,
-                   requests = Reqs} = S) ->
-    Down1 = [Node|Down -- [Node]],
-    S1 = S#state{down = Down1},
-    case [R#req.object || #req{nodes = Ns} = R <- Reqs,
-                          lists:member(Node, Ns)] of
-        [] ->
-            {noreply, S#state{down = lists:keydelete(Node, 1, Mon)}};
-        Objs ->
-            case S1#state.await_nodes of
-                false ->
-                    case [O || O <- Objs,
-                               request_can_be_served(O, S1) =:= false] of
-                        [] ->
-                            {noreply, S1};
-                        Lost ->
-                            {stop, {cannot_lock_objects, Lost}, S1}
-                    end;
-                true ->
-                    case lists:member(Node, nodes()) of
-                        true  -> watch_node(Node);
-                        false -> ignore
-                    end,
-                    {noreply, S1}
-            end
+            #state{down = Down} = S) ->
+    case lists:member(Node, Down) of
+        true -> {noreply, S};
+        false ->
+            handle_nodedown(Node, S)
     end;
 handle_info({'DOWN',_,_,_,_}, S) ->
     %% most likely a watcher
@@ -411,17 +416,18 @@ handle_info({nodedown,_}, S) ->
 handle_info({locks_running,N}, #state{down = Down, requests = Reqs} = S) ->
     case lists:member(N, Down) of
         true ->
+            S1 = S#state{down = Down -- [N]},
             case [{O,M} || #req{nodes = Ns, object = O, mode = M} <- Reqs,
                            lists:member(N, Ns)] of
                 [] ->
-                    {noreply, S#state{down = Down -- [N]}};
+                    {noreply, S1};
                 Reissue ->
-                    S1 = lists:foldl(
+                    S2 = lists:foldl(
                            fun({Obj,Mode}, Sx) ->
                                    request_lock(
                                      {Obj,N}, Mode, Sx)
-                           end, ensure_monitor(N, S), Reissue),
-                    {noreply, S1}
+                           end, ensure_monitor(N, S1), Reissue),
+                    {noreply, S2}
             end;
         false ->
             {noreply, S}
@@ -460,15 +466,43 @@ request_can_be_served(Obj, #state{down = Down, requests = Reqs}) ->
     case lists:keyfind(Obj, #req.object, Reqs) of
         #req{nodes = Ns, require = R} ->
             case R of
-                all      -> intersection(Down, Ns) == [];
-                any      -> Ns -- Down =/= [];
-                majority -> length(Ns -- Down) >= (length(Ns) div 2);
+                all       -> intersection(Down, Ns) == [];
+                any       -> Ns -- Down =/= [];
+                majority  -> length(Ns -- Down) > (length(Ns) div 2);
                 majority_alive ->
                     true
             end;
         false ->
             false
     end.
+
+handle_nodedown(Node, #state{down = Down, requests = Reqs,
+                             monitored = Mon} = S) ->
+    Down1 = [Node|Down -- [Node]],
+    S1 = S#state{down = Down1},
+    case [R#req.object || #req{nodes = Ns} = R <- Reqs,
+                          lists:member(Node, Ns)] of
+        [] ->
+            {noreply, S#state{down = lists:keydelete(Node, 1, Mon)}};
+        Objs ->
+            case S1#state.await_nodes of
+                false ->
+                    case [O || O <- Objs,
+                               request_can_be_served(O, S1) =:= false] of
+                        [] ->
+                            {noreply, check_if_done(S1)};
+                        Lost ->
+                            {stop, {cannot_lock_objects, Lost}, S1}
+                    end;
+                true ->
+                    case lists:member(Node, nodes()) of
+                        true  -> watch_node(Node);
+                        false -> ignore
+                    end,
+                    {noreply, S1}
+            end
+    end.
+
 
 watch_node(N) ->
     {M, F, A} =
@@ -511,33 +545,44 @@ ensure_monitor_(Locker, Node, Mon) ->
             orddict:store(Node, Ref, Mon)
     end.
 
-request_lock({OID, Node} = LockID, Mode, #state{pending = Reqs} = State) ->
+request_lock({OID, Node} = LockID, Mode, #state{pending = Reqs,
+                                                client = Client} = State) ->
     P = {?LOCKER, Node},
     erlang:monitor(process, P),
-    locks_server:lock(OID, [Node], Mode),
+    locks_server:lock(OID, [Node], Client, Mode),
     State#state{pending = [LockID | Reqs -- [LockID]]}.
 
 request_surrender({OID, Node} = _LockID, #state{}) ->
     ?dbg("request_surrender(~p~n", [_LockID]),
     locks_server:surrender(OID, Node).
 
-check_if_done(#state{pending = []} = State) ->
-    State#state{have_all = true};
-check_if_done(#state{} = State) ->
+check_if_done(S) ->
+    check_if_done(S, []).
+
+check_if_done(#state{pending = []} = State, Msgs) ->
+    notify_msgs(Msgs, State#state{have_all = true});
+check_if_done(#state{} = State, Msgs) ->
     case waitingfor(State) of
 	[_|_] = _WF ->   % not done
             ?dbg("~p: waitingfor() -> ~p - not done~n", [self(), _WF]),
-	    State#state{have_all = false};
+	    notify_msgs(Msgs, State#state{have_all = false});
 	[] ->
 	    %% _DLs = State#state.deadlocks,
 	    Msg = {have_all_locks, State#state.deadlocks},
 	    ?dbg("~p: have all locks~n", [self()]),
-	    notify(Msg, State#state{have_all = true})
+	    notify_msgs([Msg|Msgs], State#state{have_all = true})
     end.
 
 abort_on_deadlock(OID, State) ->
     notify({abort, Reason = {deadlock, OID}}, State),
     error(Reason).
+
+notify_msgs([M|Ms], S) ->
+    S1 = notify_msgs(Ms, S),
+    notify(M, S1);
+notify_msgs([], S) ->
+    S.
+
 
 notify(Msg, #state{notify = Notify} = State) ->
     NewNotify =
@@ -545,7 +590,7 @@ notify(Msg, #state{notify = Notify} = State) ->
           fun({P, events}) ->
                   P ! {?MODULE, self(), Msg},
                   true;
-             ({P, R, await_all_locks}) ->
+             ({P, R, await_all_locks}) when element(1,Msg) == have_all_locks ->
                   gen_server:reply({P, R}, Msg),
                   false;
              (_) ->
@@ -685,7 +730,7 @@ waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs,
         lists:foldl(
           fun(#req{object = OID, require = majority, nodes = Ns}, Acc) ->
                   NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
-                  case length(NodesLocked) >= (length(Ns) div 2) of
+                  case length(NodesLocked) > (length(Ns) div 2) of
                       true ->
                           [ID || {O,_} = ID <- Acc, O =/= OID];
                       false ->
@@ -694,7 +739,7 @@ waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs,
              (#req{object = OID, require = majority_alive, nodes = Ns}, Acc) ->
                   Alive = Ns -- Down,
                   NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
-                  case length(NodesLocked) >= (length(Alive) div 2) of
+                  case length(NodesLocked) > (length(Alive) div 2) of
                       true ->
                           [ID || {O,_} = ID <- Acc, O =/= OID];
                       false ->

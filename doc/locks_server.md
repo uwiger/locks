@@ -10,12 +10,26 @@
 ## Function Index ##
 
 
-<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#code_change-3">code_change/3</a></td><td></td></tr><tr><td valign="top"><a href="#handle_call-3">handle_call/3</a></td><td></td></tr><tr><td valign="top"><a href="#handle_cast-2">handle_cast/2</a></td><td></td></tr><tr><td valign="top"><a href="#handle_info-2">handle_info/2</a></td><td></td></tr><tr><td valign="top"><a href="#init-1">init/1</a></td><td></td></tr><tr><td valign="top"><a href="#lock-2">lock/2</a></td><td></td></tr><tr><td valign="top"><a href="#lock-3">lock/3</a></td><td></td></tr><tr><td valign="top"><a href="#lock-4">lock/4</a></td><td></td></tr><tr><td valign="top"><a href="#remove_agent-1">remove_agent/1</a></td><td></td></tr><tr><td valign="top"><a href="#remove_agent-2">remove_agent/2</a></td><td></td></tr><tr><td valign="top"><a href="#start_link-0">start_link/0</a></td><td></td></tr><tr><td valign="top"><a href="#surrender-2">surrender/2</a></td><td></td></tr><tr><td valign="top"><a href="#surrender-3">surrender/3</a></td><td></td></tr><tr><td valign="top"><a href="#terminate-2">terminate/2</a></td><td></td></tr><tr><td valign="top"><a href="#unwatch-2">unwatch/2</a></td><td></td></tr><tr><td valign="top"><a href="#watch-2">watch/2</a></td><td></td></tr></table>
+<table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#agents-1">agents/1</a></td><td></td></tr><tr><td valign="top"><a href="#clients-1">clients/1</a></td><td></td></tr><tr><td valign="top"><a href="#code_change-3">code_change/3</a></td><td></td></tr><tr><td valign="top"><a href="#handle_call-3">handle_call/3</a></td><td></td></tr><tr><td valign="top"><a href="#handle_cast-2">handle_cast/2</a></td><td></td></tr><tr><td valign="top"><a href="#handle_info-2">handle_info/2</a></td><td></td></tr><tr><td valign="top"><a href="#init-1">init/1</a></td><td></td></tr><tr><td valign="top"><a href="#lock-2">lock/2</a></td><td></td></tr><tr><td valign="top"><a href="#lock-3">lock/3</a></td><td></td></tr><tr><td valign="top"><a href="#lock-4">lock/4</a></td><td></td></tr><tr><td valign="top"><a href="#remove_agent-1">remove_agent/1</a></td><td></td></tr><tr><td valign="top"><a href="#remove_agent-2">remove_agent/2</a></td><td></td></tr><tr><td valign="top"><a href="#start_link-0">start_link/0</a></td><td></td></tr><tr><td valign="top"><a href="#surrender-2">surrender/2</a></td><td></td></tr><tr><td valign="top"><a href="#surrender-3">surrender/3</a></td><td></td></tr><tr><td valign="top"><a href="#terminate-2">terminate/2</a></td><td></td></tr><tr><td valign="top"><a href="#unwatch-2">unwatch/2</a></td><td></td></tr><tr><td valign="top"><a href="#watch-2">watch/2</a></td><td></td></tr><tr><td valign="top"><a href="#watchers-1">watchers/1</a></td><td></td></tr></table>
 
 
 <a name="functions"></a>
 
 ## Function Details ##
+
+<a name="agents-1"></a>
+
+### agents/1 ###
+
+`agents(LockID) -> any()`
+
+
+<a name="clients-1"></a>
+
+### clients/1 ###
+
+`clients(LockID) -> any()`
+
 
 <a name="code_change-3"></a>
 
@@ -35,7 +49,7 @@
 
 ### handle_cast/2 ###
 
-`handle_cast(X1, St) -> any()`
+`handle_cast(Msg, St) -> any()`
 
 
 <a name="handle_info-2"></a>
@@ -70,7 +84,7 @@
 
 ### lock/4 ###
 
-`lock(LockID, Nodes, TID, Mode) -> any()`
+`lock(LockID, Nodes, Client, Mode) -> any()`
 
 
 <a name="remove_agent-1"></a>
@@ -127,5 +141,12 @@
 ### watch/2 ###
 
 `watch(LockID, Nodes) -> any()`
+
+
+<a name="watchers-1"></a>
+
+### watchers/1 ###
+
+`watchers(LockID) -> any()`
 
 

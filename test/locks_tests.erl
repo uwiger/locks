@@ -20,8 +20,12 @@
 
 run_test_() ->
     {setup,
-     fun() -> application:start(locks) end,
-     fun(_) -> application:stop(locks) end,
+     fun() ->
+             ok = application:start(locks)
+     end,
+     fun(_) ->
+             ok = application:stop(locks)
+     end,
      {inorder,
       [
        ?_test(simple_lock())
@@ -56,15 +60,17 @@ run_test_() ->
 
 
 simple_lock() ->
-    script([1], [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
+    L = [?MODULE,?LINE],
+    script([1], [{1, ?LINE, locks, lock, ['$agent', L], match({ok,[]})},
                  {1, ?LINE, locks, end_transaction, ['$agent'], match(ok)},
                  {1, ?LINE, erlang, is_process_alive, ['$agent'], match(false)},
                  {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 one_lock_two_clients() ->
+    L = [?MODULE, ?LINE],
     script([1,2],
-           [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
-            {2, ?LINE, locks, lock, ['$agent', [a]], 100,
+           [{1, ?LINE, locks, lock, ['$agent', L], match({ok,[]})},
+            {2, ?LINE, locks, lock, ['$agent', L], 100,
              match(timeout, timeout)},
             {2, ?LINE, ?MODULE, client_waits, [], match(true)},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -72,31 +78,42 @@ one_lock_two_clients() ->
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 lock_upgrade1() ->
+    L1 = [?MODULE, ?LINE],
+    L2 = L1 ++ [1],
     script([1,2],
-           [{1, ?LINE, locks, lock, ['$agent', [a], read], match({ok, []})},
-            {1, ?LINE, locks, lock, ['$agent', [a], write], match({ok, []})},
-            {2, ?LINE, locks, lock, ['$agent', [a,1],read], 100,
+           [
+            %% {1, ?LINE, trace, true},
+            %% {2, ?LINE, trace, true},
+            {1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
+            {1, ?LINE, locks, lock, ['$agent', L1, write], match({ok, []})},
+            {2, ?LINE, locks, lock, ['$agent', L2,read], 100,
              match(timeout, timeout)},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
-            {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+            %% {1, ?LINE, trace, false},
+            {2, ?LINE, ?MODULE, kill_client, [], match(ok)}
+           ]).
 
 lock_upgrade2() ->
+    L1 = [?MODULE, ?LINE],
+    L2 = L1 ++ [1],
     script([1,2],
-           [{1, ?LINE, locks, lock, ['$agent', [a], read], match({ok, []})},
-            {2, ?LINE, locks, lock, ['$agent', [a,1], read], match({ok,[]})},
-            {1, ?LINE, locks, lock, ['$agent', [a], write], 100,
+           [{1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
+            {2, ?LINE, locks, lock, ['$agent', L2, read], match({ok,[]})},
+            {1, ?LINE, locks, lock, ['$agent', L1, write], 100,
              match(timeout, timeout)},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {1, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_direct_deadlock() ->
+    A = [?MODULE, ?LINE],
+    B = [?MODULE, ?LINE],
     script([1,2],
-           [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok,[]})},
-            {2, ?LINE, locks, lock, ['$agent', [b]], match({ok,[]})},
-            {1, ?LINE, locks, lock, ['$agent', [b]], 100, match(timeout,timeout)},
-            {2, ?LINE, locks, lock, ['$agent', [a]], 100, match(timeout,timeout)},
+           [{1, ?LINE, locks, lock, ['$agent', A], match({ok,[]})},
+            {2, ?LINE, locks, lock, ['$agent', B], match({ok,[]})},
+            {1, ?LINE, locks, lock, ['$agent', B], 100, match(timeout,timeout)},
+            {2, ?LINE, locks, lock, ['$agent', A], 100, match(timeout,timeout)},
             {1, ?LINE, ?MODULE, client_result, [],
              fun(normal, {ok, [_]}, St) -> St end},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -127,12 +144,16 @@ three_clients_deadlock() ->
        {3, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_hierarchical_deadlock() ->
+    A = [?MODULE, ?LINE],
+    A1 = A ++ [1],
+    B = [?MODULE, ?LINE],
+    B1 = B ++ [1],
     script(
       [1,2],
-      [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok, []})},
-       {2, ?LINE, locks, lock, ['$agent', [b]], match({ok, []})},
-       {1, ?LINE, locks, lock, ['$agent', [b,1]], 100, match(timeout, timeout)},
-       {2, ?LINE, locks, lock, ['$agent', [a,1]], 100, match(timeout, timeout)},
+      [{1, ?LINE, locks, lock, ['$agent', A], match({ok, []})},
+       {2, ?LINE, locks, lock, ['$agent', B], match({ok, []})},
+       {1, ?LINE, locks, lock, ['$agent', B1], 100, match(timeout, timeout)},
+       {2, ?LINE, locks, lock, ['$agent', A1], 100, match(timeout, timeout)},
        {1, ?LINE, ?MODULE, client_result, [],
         fun(normal, {ok, [_|_]}, St) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -141,12 +162,15 @@ two_clients_hierarchical_deadlock() ->
        {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_abort_on_deadlock() ->
+    A = [?MODULE, ?LINE],
+    B = [?MODULE, ?LINE],
     script(
       [1, {2, [{abort_on_deadlock, true},{link,false}]}],
-      [{1, ?LINE, locks, lock, ['$agent', [a]], match({ok, []})},
-       {2, ?LINE, locks, lock, ['$agent', [b]], match({ok, []})},
-       {1, ?LINE, locks, lock, ['$agent', [b]], 100, match(timeout,timeout)},
-       {2, ?LINE, locks, lock, ['$agent', [a]], match(error, '_')},
+      [{1, ?LINE, locks, lock, ['$agent', A], match({ok, []})},
+       {2, ?LINE, locks, lock, ['$agent', B], match({ok, []})},
+       {1, ?LINE, locks, lock, ['$agent', B], 100, match(timeout,timeout)},
+       {2, ?LINE, info, "Expect crash to follow", []},
+       {2, ?LINE, locks, lock, ['$agent', A], match(error, '_')},
        {1, ?LINE, ?MODULE, client_result, [],
         fun(normal, {ok, _}, St) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
@@ -154,27 +178,30 @@ two_clients_abort_on_deadlock() ->
        ]).
 
 d_simple_lock_all(Ns) ->
+    A = [?MODULE, ?LINE],
     script(
       [1],
-      [{1, ?LINE, locks, lock, ['$agent', [a], write, [node()|Ns], all],
+      [{1, ?LINE, locks, lock, ['$agent', A, write, [node()|Ns], all],
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 d_simple_lock_majority(Ns) ->
+    A = [?MODULE, ?LINE],
     [_, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
     Dead = list_to_atom("dead_1@" ++ Host),
     script(
       [1],
-      [{1, ?LINE, locks, lock, ['$agent', [a], write, [Dead|Ns], majority],
+      [{1, ?LINE, locks, lock, ['$agent', A, write, [Dead|Ns], majority],
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 d_simple_lock_any(Ns) ->
+    A = [?MODULE, ?LINE],
     [_, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
     Dead = list_to_atom("dead_1@" ++ Host),
     script(
       [1],
-      [{1, ?LINE, locks, lock, ['$agent', [a], write, [Dead,hd(Ns)], any],
+      [{1, ?LINE, locks, lock, ['$agent', A, write, [Dead,hd(Ns)], any],
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
@@ -182,18 +209,18 @@ script(Agents, S) ->
     AgentPids = [spawn_agent(A) || A <- Agents],
     try eval_script(S, AgentPids)
     after
-        [kill_client(C) || {_, C, _} <- AgentPids]
+        [kill_client(C) || {_, C, _, _} <- AgentPids]
     end.
 
 spawn_agent(A) when is_atom(A); is_integer(A) ->
-    {ok, Pid} = spawn_client(),
-    {A, Pid, []};
+    {ok, Pid, APid} = spawn_client(),
+    {A, Pid, APid, []};
 spawn_agent({A, [_|_] = Opts}) when is_atom(A); is_integer(A) ->
-    {ok, Pid} = spawn_client(Opts),
-    {A, Pid, []};
+    {ok, Pid, APid} = spawn_client(Opts),
+    {A, Pid, APid, []};
 spawn_agent({A, [_|_] = Opts, St0}) when is_atom(A); is_integer(A) ->
-    {ok, Pid} = spawn_client(Opts),
-    {A, Pid, St0}.
+    {ok, Pid, APid} = spawn_client(Opts),
+    {A, Pid, APid, St0}.
 
 spawn_client() ->
     spawn_client([]).
@@ -202,12 +229,12 @@ spawn_client(Opts) ->
     Me = self(),
     P = spawn_link(fun() ->
                            {ok, A} = locks_agent:start(Opts),
-                           Me ! {self(), ok},
+                           Me ! {self(), ok, A},
                            client_loop(A)
                    end),
     receive
-        {P, ok} ->
-            {ok, P}
+        {P, ok, A} ->
+            {ok, P, A}
     end.
 
 client_waits(P) ->
@@ -269,20 +296,35 @@ eval_script([E|S], Agents) ->
     Agents1 = ask_agent(E, Agents),
     eval_script(S, Agents1);
 eval_script([], Agents) ->
-    Remain = [A || {_, Pid, _} = A <- Agents,
+    Remain = [A || {_, Pid, _, _} = A <- Agents,
                    is_process_alive(Pid)],
     [] = Remain,
     ok.
 
+ask_agent({A, L, trace, Bool}, Agents) ->
+    {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
+    if Bool ->
+            dbg:tracer(),
+            dbg:tpl(locks_agent, x),
+            dbg:p([Pid, APid], [c,m]);
+       true ->
+            dbg:ctpl(locks_agent),
+            dbg:stop()
+    end,
+    Agents;
+ask_agent({A, L, info, Fmt, Args}, Agents) ->
+    {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
+    ?debugFmt("(INFO ~p/~p): " ++ Fmt, [Pid,APid|Args]),
+    Agents;
 ask_agent({A, L, M, F, Args, Match}, Agents) ->
     ask_agent({A, L, M, F, Args, infinity, Match}, Agents);
 ask_agent({A, _, M, F, Args, Timeout, Match} = _E, Agents) ->
     io:fwrite(user, "ask_agent(~p)~n", [_E]),
-    {_, Pid, St} = lists:keyfind(A, 1, Agents),
+    {_, Pid, APid, St} = lists:keyfind(A, 1, Agents),
     {C, Res} = ask_client(Pid, M, F, Args, Timeout),
     io:fwrite(user, "~p -> ~p:~p~n", [_E, C, Res]),
     St1 = Match(C, Res, St),
-    lists:keyreplace(A, 1, Agents, {A, Pid, St1}).
+    lists:keyreplace(A, 1, Agents, {A, Pid, APid, St1}).
 
 repl_agent(Pid, Args) ->
     lists:map(fun('$agent') -> Pid;

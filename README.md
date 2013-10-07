@@ -102,5 +102,6 @@ few lock servers are available to fulfill the lock requirement, it will abort.
 <table width="100%" border="0" summary="list of modules">
 <tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks.md" class="module">locks</a></td></tr>
 <tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_agent.md" class="module">locks_agent</a></td></tr>
+<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_leader.md" class="module">locks_leader</a></td></tr>
 <tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_server.md" class="module">locks_server</a></td></tr></table>
 
