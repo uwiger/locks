@@ -62,6 +62,7 @@
 
 -record(state, {
           locks = []       :: [#lock{}],
+          claimed = []     :: [lock_id()],
           requests = []    :: [#req{}],
           down = []        :: [node()],
           monitored = []   :: [{node(), reference()}],
@@ -450,7 +451,7 @@ await_all_locks_(Client, Tag, State) ->
 	    {noreply, State};
         {have_all, Deadlocks} ->
             gen_server:reply({Client, Tag}, {have_all_locks, Deadlocks}),
-            {noreply, State};
+            {noreply, State#state{have_all = true}};
         waiting ->
             Entry = {Client, Tag, await_all_locks},
             {noreply, State#state{notify = [Entry|State#state.notify]}};
@@ -560,18 +561,24 @@ check_if_done(S) ->
     check_if_done(S, []).
 
 check_if_done(#state{pending = []} = State, Msgs) ->
-    notify_msgs(Msgs, State#state{have_all = true});
+    notify_msgs(Msgs, have_all(State));
 check_if_done(#state{} = State, Msgs) ->
     case waitingfor(State) of
 	[_|_] = _WF ->   % not done
             ?dbg("~p: waitingfor() -> ~p - not done~n", [self(), _WF]),
+            %% We don't clear the 'claimed' list here, since it tells us if
+            %% we have told our client we have a certain lock
 	    notify_msgs(Msgs, State#state{have_all = false});
 	[] ->
 	    %% _DLs = State#state.deadlocks,
 	    Msg = {have_all_locks, State#state.deadlocks},
 	    ?dbg("~p: have all locks~n", [self()]),
-	    notify_msgs([Msg|Msgs], State#state{have_all = true})
+	    notify_msgs([Msg|Msgs], have_all(State))
     end.
+
+have_all(#state{locks = Locks} = State) ->
+    State#state{have_all = true,
+                claimed = [OID || #lock{object = OID} <- Locks]}.
 
 abort_on_deadlock(OID, State) ->
     notify({abort, Reason = {deadlock, OID}}, State),
@@ -626,9 +633,12 @@ handle_locks(#state{locks = Locks, deadlocks = Deadlocks} = State) ->
 	{deadlock,ShouldSurrender,ToObject} ->
 	    ?dbg("~p: deadlock: ShouldSurrender = ~p, ToObject = ~p~n",
 		 [self(), ShouldSurrender, ToObject]),
-            case ShouldSurrender == self() andalso
-                proplists:get_value(
-                  abort_on_deadlock, State#state.options, false) of
+            case ShouldSurrender == self()
+                andalso
+                (proplists:get_value(
+                   abort_on_deadlock, State#state.options, false)
+                 andalso lists:member(ToObject,
+                                      State#state.claimed) == true)  of
                 true -> abort_on_deadlock(ToObject, State);
                 false -> ok
             end,

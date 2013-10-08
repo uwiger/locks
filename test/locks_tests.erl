@@ -301,7 +301,7 @@ eval_script([], Agents) ->
     [] = Remain,
     ok.
 
-ask_agent({A, L, trace, Bool}, Agents) ->
+ask_agent({A, _L, trace, Bool}, Agents) ->
     {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
     if Bool ->
             dbg:tracer(),
@@ -312,7 +312,7 @@ ask_agent({A, L, trace, Bool}, Agents) ->
             dbg:stop()
     end,
     Agents;
-ask_agent({A, L, info, Fmt, Args}, Agents) ->
+ask_agent({A, _L, info, Fmt, Args}, Agents) ->
     {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
     ?debugFmt("(INFO ~p/~p): " ++ Fmt, [Pid,APid|Args]),
     Agents;
