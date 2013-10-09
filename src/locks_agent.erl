@@ -11,7 +11,15 @@
 %% Key contributor: Thomas Arts <thomas.arts@quviq.com>
 %%
 %%=============================================================================
-
+%% @doc Transaction agent for the locks system
+%%
+%% This module implements the recommended API for users of the `locks' system.
+%% While the `locks_server' has a low-level API, the `locks_agent' is the
+%% part that detects and resolves deadlocks.
+%%
+%% The agent runs as a separate process from the client, and monitors the
+%% client, terminating immediately if it dies.
+%% @end
 -module(locks_agent).
 
 -behaviour(gen_server).
@@ -53,7 +61,8 @@
 
 -type option()      :: {client, pid()}
                      | {abort_on_deadlock, boolean()}
-                     | {await_nodes, boolean()}.
+                     | {await_nodes, boolean()}
+                     | {notify, boolean()}.
 
 -record(req, {object,
               mode,
@@ -83,12 +92,57 @@
 
 %%% interface function
 
+%% @spec start_link() -> {ok, pid()}
+%% @equiv start_link([])
 start_link() ->
     start([{link, true}]).
 
+-spec start_link([option()]) -> {ok, pid()}.
+%% @doc Starts an agent with options, linking to the client.
+%%
+%% Note that even if `{link, false}' is specified in the Options, this will
+%% be overridden by `{link, true}', implicit in the function name.
+%%
+%% Linking is normally not required, as the agent will always monitor the
+%% client and terminate if the client dies.
+%%
+%% See also {@link start/1}.
+%% @end
 start_link(Options) when is_list(Options) ->
     start(lists:keystore(link, 1, Options, {link, true})).
 
+-spec start([option()]) -> {ok, pid()}.
+%% @doc Starts an agent with options.
+%%
+%% Options are:
+%%
+%% * `{client, pid()}' - defaults to `self()', indicating which process is
+%% the client. The agent will monitor the client, and only accept lock
+%% requests from it (this may be extended in future version).
+%%
+%% * `{link, boolean()}' - default: `false'. Whether to link the current
+%% process to the agent. This is normally not required, but will have the
+%% effect that the current process (normally the client) receives an 'EXIT'
+%% signal if the agent aborts.
+%%
+%% * `{abort_on_deadlock, boolean()}' - default: `false'. Normally, when
+%% deadlocks are detected, one agent will be picked to surrender a lock.
+%% This can be problematic if the client has already been notified that the
+%% lock has been granted. If `{abort_on_deadlock, true}', the agent will
+%% abort if it would otherwise have had to surrender, <b>and</b> the client
+%% has been told that the lock has been granted.
+%%
+%% * `{await_nodes, boolean()}' - default: `false'. If nodes 'disappear'
+%% (i.e. the locks_server there goes away) and `{await_nodes, false}',
+%% the agent will consider those nodes lost and may abort if the lock
+%% request(s) cannot be granted without the lost nodes. If `{await_nodes,true}',
+%% the agent will wait for the nodes to reappear, and reclaim the lock(s) when
+%% they do.
+%%
+%% * `{notify, boolean()}' - default: `false'. If `{notify, true}', the client
+%% will receive `{locks_agent, Agent, Info}' messages, where `Info' is either
+%% a `#locks_info{}' record or `{have_all_locks, Deadlocks}'.
+%% @end
 start(Options0) when is_list(Options0) ->
     case whereis(locks_server) of
         undefined -> error({not_running, locks_server});
@@ -107,10 +161,19 @@ start(Options0) when is_list(Options0) ->
     end.
 
 -spec begin_transaction(objs()) -> {agent(), lock_result()}.
+%% @equiv begin_transaction(Objects, [])
+%%
 begin_transaction(Objects) ->
     begin_transaction(Objects, []).
 
 -spec begin_transaction(objs(), options()) -> {agent(), lock_result()}.
+%% @doc Starts an agent and requests a number of locks at the same time.
+%%
+%% For a description of valid options, see {@link start/1}.
+%%
+%% This function will return once the given lock requests have been granted,
+%% or exit if they cannot be.
+%% @end
 begin_transaction(Objects, Opts) ->
     {ok, Agent} = start(Opts),
     _ = lock_objects(Agent, Objects),
@@ -118,11 +181,21 @@ begin_transaction(Objects, Opts) ->
 
 
 -spec await_all_locks(agent()) -> lock_result().
+%% @doc Waits for all active lock requests to be granted.
+%%
+%% This function will return once all active lock requests have been granted.
+%% If the agent determines that they cannot be granted, or if it has been
+%% instructed to abort, this function will raise an exception.
+%% @end
 await_all_locks(Agent) ->
     call(Agent, await_all_locks,infinity).
 
 
 -spec end_transaction(agent()) -> ok.
+%% @doc Ends the transaction, terminating the agent.
+%%
+%% All lock requests issued via the agent will automatically be released.
+%% @end
 end_transaction(Agent) when is_pid(Agent) ->
     call(Agent,stop).
 
@@ -166,7 +239,8 @@ lock_(Agent, Obj, Mode, Where, R, Wait) ->
 
 change_flag(Agent, Option, Bool)
   when is_boolean(Bool), Option == abort_on_deadlock;
-       is_boolean(Bool), Option == await_nodes ->
+       is_boolean(Bool), Option == await_nodes;
+       is_boolean(Bool), Option == notify ->
     gen_server:cast(Agent, {option, Option, Bool}).
 
 cast(Agent, Msg, Ref) ->
@@ -334,6 +408,14 @@ handle_cast({option, O, Val}, #state{options = Opts} = S) ->
     S1 = case O of
              await_nodes ->
                  S#state{await_nodes = Val};
+             notify ->
+                 Entry = {S#state.client, events},
+                 case Val of
+                     true ->
+                         S#state{notify = [Entry|S#state.notify -- [Entry]]};
+                     false ->
+                         S#state{notify = S#state.notify -- [Entry]}
+                 end;
              _ ->
                  S#state{options = lists:keystore(O, 1, Opts, {O, Val})}
          end,
@@ -450,8 +532,9 @@ await_all_locks_(Client, Tag, State) ->
             gen_server:reply({Client, Tag}, {error, no_locks}),
 	    {noreply, State};
         {have_all, Deadlocks} ->
-            gen_server:reply({Client, Tag}, {have_all_locks, Deadlocks}),
-            {noreply, State#state{have_all = true}};
+            Msg = {have_all_locks, Deadlocks},
+            gen_server:reply({Client, Tag}, Msg),
+            {noreply, notify(Msg, State#state{have_all = true})};
         waiting ->
             Entry = {Client, Tag, await_all_locks},
             {noreply, State#state{notify = [Entry|State#state.notify]}};

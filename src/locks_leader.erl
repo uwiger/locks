@@ -63,6 +63,7 @@
 	 code_change/3]).
 
 -export([candidates/1,
+         new_candidates/1,
 	 workers/1,
 	 leader/1]).
 
@@ -97,6 +98,8 @@
 	  nodes = [],
 	  candidates = [],
 	  workers = [],
+          synced = [],
+          synced_workers = [],
 	  gen_server_opts = [],
 	  regname,
 	  mod,
@@ -125,6 +128,9 @@
 %%     F(candidates).
 candidates(#st{candidates = C}) ->
     C.
+
+new_candidates(#st{candidates = C, synced = S}) ->
+    C -- S.
 
 %% workers(F) when is_function(F, 1) ->
 %%     F(workers).
@@ -259,6 +265,9 @@ safe_loop(#st{agent = A} = S) ->
 	{?MODULE, am_leader, L, LeaderMsg} = _Msg ->
 	    ?event(_Msg, S),
 	    noreply(leader_announced(L, LeaderMsg, S));
+        {?MODULE, from_leader, L, LeaderMsg} = _Msg ->
+            ?event(_Msg, S),
+            noreply(from_leader(L, LeaderMsg, S));
 	{?MODULE, am_worker, W} = _Msg ->
 	    ?event(_Msg, S),
 	    noreply(worker_announced(W, S));
@@ -291,6 +300,9 @@ handle_info(#locks_info{lock = #lock{object = Lock}} = I,
 handle_info({?MODULE, am_leader, L, LeaderMsg} = _M, S) ->
     ?event({handle_info, _M}, S),
     noreply(leader_announced(L, LeaderMsg, S));
+handle_info({?MODULE, from_leader, L, LeaderMsg} = _M, S) ->
+    ?event({handle_info, _M}, S),
+    noreply(from_leader(L, LeaderMsg, S));
 handle_info({Ref, {'$locks_leader_reply', Reply}} = _M,
 	    #st{buffered = Buf} = S) ->
     ?event({handle_info, _M}, S),
@@ -396,13 +408,13 @@ maybe_announce_leader(Pid, #st{leader = L, mod = M, mod_state = MSt} = S) ->
     if L == self() ->
 	    case M:elected(MSt, opaque(S), Pid) of
 		{reply, Msg, MSt1} ->
-		    Pid ! {?MODULE, am_leader, L, Msg},
+		    Pid ! {?MODULE, from_leader, L, Msg},
 		    S#st{mod_state = MSt1};
 		{ok, MSt1} ->
 		    S#st{mod_state = MSt1};
 		{ok, Msg, MSt1} ->
 		    broadcast(S#st{mod_state = MSt1},
-			      {?MODULE, am_leader, L, Msg})
+			      {?MODULE, from_leader, L, Msg})
 	    end;
        true ->
 	    S
@@ -420,13 +432,32 @@ maybe_remove_cand(worker, Pid, #st{workers = Ws} = S) ->
     S#st{workers = Ws -- [Pid]}.
 
 
-become_leader(#st{leader = L} = S) when L == self() ->
-    S;
+become_leader(#st{leader = L, mod = M, mod_state = MSt,
+                  candidates = Cands, synced = Synced,
+                  workers = Ws, synced_workers = SyncedWs} = S)
+  when L == self() ->
+    ?event(become_leader_again, S),
+    NewCands = Cands -- Synced,
+    NewWs = Ws -- SyncedWs,
+    {AmLeaderMsg, FromLeaderMsg, ModSt1} =
+        case M:elected(MSt, opaque(S), undefined) of
+            {ok, Msg1, Msg2, MSt1} -> {Msg1, Msg2, MSt1};
+            {ok, Msg, MSt1}        -> {Msg , Msg , MSt1};
+            {error, Reason}        -> error(Reason)
+        end,
+    AmLeader = {?MODULE, am_leader, self(), AmLeaderMsg},
+    FromLeader = {?MODULE, from_leader, self(), FromLeaderMsg},
+    broadcast_(NewCands, AmLeader),
+    broadcast_(NewWs, AmLeader),
+    broadcast_(Synced, FromLeader),
+    broadcast_(SyncedWs, FromLeader),
+    S#st{mod_state = ModSt1, synced = Cands, synced_workers = Ws};
 become_leader(#st{mod = M, mod_state = MSt} = S) ->
     ?event(become_leader, S),
     case M:elected(MSt, opaque(S), undefined) of
 	{ok, Msg, MSt1} ->
-	    broadcast(S#st{mod_state = MSt1, leader = self()},
+	    broadcast(S#st{mod_state = MSt1, leader = self(),
+                           synced = S#st.candidates},
 		      {?MODULE, am_leader, self(), Msg});
 	{error, Reason} ->
 	    error(Reason)
@@ -475,12 +506,18 @@ callback_reply({stop, Reason, MSt}, _, _, S) ->
     {stop, Reason, S#st{mod_state = MSt}}.
 
 broadcast(#st{candidates = Cands, workers = Ws} = S, Msg) ->
-    [P ! Msg || P <- Cands],
-    [P ! Msg || P <- Ws],
+    broadcast_(Cands ++ Ws, Msg),
     S.
 
-from_leader(Msg, #st{mod = M, mod_state = MSt} = S) ->
-    callback(M:from_leader(Msg, MSt, opaque(S)), S).
+broadcast_(Pids, Msg) when is_list(Pids) ->
+    [P ! Msg || P <- Pids],
+    ok.
+
+from_leader(L, Msg, #st{leader = L, mod = M, mod_state = MSt} = S) ->
+    callback(M:from_leader(Msg, MSt, opaque(S)), S);
+from_leader(_OtherL, _Msg, S) ->
+    ?event({ignoring_from_leader, _OtherL, _Msg}, S),
+    S.
 
 leader_announced(L, Msg, #st{leader = L, mod = M, mod_state = MSt} = S) ->
     callback(M:surrendered(MSt, Msg, opaque(S)), S);
