@@ -17,8 +17,7 @@
 %% also possible to have multiple candidates and workers on the same node.
 %%
 %% The candidate that is able to claim The Lock becomes the leader.
-%% <pre>
-%% Leader instance:
+%% <pre>Leader instance:
 %%    Mod:elected(ModState, Info, undefined) -&gt; {ok, Sync, ModState1}.
 %%
 %% Other instances:
@@ -44,6 +43,11 @@
 %% surrendered(S, Sync, _Info) -&gt;
 %%     {ok, normal_surrender(S, Sync, Info)}.
 %% </pre>
+%%
+%% The newly elected candidate normally doesn't know that a split-brain
+%% has occurred, but can sync with other candidates using e.g. the function
+%% {@link ask_candidates/2}, which functions rather like a parallel
+%% `gen_server:call/2'.
 %% @end
 -module(locks_leader).
 -behaviour(gen_server).
@@ -65,11 +69,19 @@
 -export([candidates/1,
          new_candidates/1,
 	 workers/1,
-	 leader/1]).
+	 leader/1,
+         leader_node/1]).
+
+-export([reply/2,
+         broadcast/2,
+         broadcast_to_candidates/2,
+         ask_candidates/2]).
 
 -export_type([leader_info/0, mod_state/0, msg/0]).
 
-
+-type option() :: {role, candidate | worker}
+                | {resource, any()}.
+-type ldr_options() :: [option()].
 -type mod_state() :: any().
 -type msg() :: any().
 -type reply() :: any().
@@ -111,6 +123,8 @@
 -define(event(E), event(?LINE, E, none)).
 -define(event(E, S), event(?LINE, E, S)).
 
+-opaque election() :: #st{}.
+
 -callback init(any()) -> mod_state().
 -callback elected(mod_state(), leader_info(), undefined | pid()) ->
     cb_return() | {reply, msg(), mod_state()}.
@@ -124,34 +138,180 @@
 -callback handle_cast(msg(), mod_state(), leader_info()) -> cb_return().
 -callback handle_info(msg(), mod_state(), leader_info()) -> cb_return().
 
-%% candidates(F) when is_function(F, 1) ->
-%%     F(candidates).
+-spec candidates(election()) -> [pid()].
+%% @doc Return the current list of candidates.
+%% @end
 candidates(#st{candidates = C}) ->
     C.
 
+-spec new_candidates(election()) -> [pid()].
+%% @doc Return the current list of candidates that have not yet been synced.
+%%
+%% This function is mainly indented to be used from within `Mod:elected/3',
+%% once a leader has been elected. One possible use is to contact the
+%% new candidates to see whether one of them was a leader, which could
+%% be the case if the candidates appeared after a healed netsplit.
+%% @end
 new_candidates(#st{candidates = C, synced = S}) ->
     C -- S.
 
-%% workers(F) when is_function(F, 1) ->
-%%     F(workers).
+-spec workers(election()) -> [pid()].
+%% @doc Return the current list of workers.
+%% @end
 workers(#st{workers = W}) ->
     W.
 
-%% leader(F) when is_function(F, 1) ->
-%%     F(leader).
+-spec leader(election()) -> pid() | undefined.
+%% @doc Return the leader pid, or `undefined' if there is no current leader.
+%% @end
 leader(#st{leader = L}) ->
     L.
 
+-spec leader_node(election()) -> node().
+%% @doc Return the node of the current leader.
+%%
+%% This function is mainly present for compatibility with `gen_leader'.
+%% @end
+leader_node(#st{leader = L}) when is_pid(L) ->
+    node(L).
+
+-spec reply({pid(), any()}, any()) -> ok.
+%% @doc Corresponds to `gen_server:reply/2'.
+%%
+%% Callback modules should use this function instead in order to be future
+%% safe.
+%% @end
+reply(From, Reply) ->
+    gen_server:reply(From, Reply).
+
+-spec broadcast(any(), election()) -> ok.
+%% @doc Broadcast `Msg' to all candidates and workers.
+%%
+%% This function may only be called from the current leader.
+%%
+%% The message will be processed in the `Mod:from_leader/3' callback.
+%% Note: You should not use this function from the `Mod:elected/3' function,
+%% since it may cause sequencing issues with the broadcast message that is
+%% (normally) sent once the `Mod:elected/3' function returns.
+%% @end
+broadcast(Msg, #st{leader = L} = S) when L == self() ->
+    do_broadcast(msg(from_leader, Msg), S),
+    ok;
+broadcast(_, _) ->
+    error(not_leader).
+
+-spec broadcast_to_candidates(any(), election()) -> ok.
+%% @doc Broadcast `Msg' to all (synced) candidates.
+%%
+%% This function may only be called from the current leader.
+%%
+%% The message will be processed in the `Mod:from_leader/3' callback.
+%% Note: You should not use this function from the `Mod:elected/3' function,
+%% since it may cause sequencing issues with the broadcast message that is
+%% (normally) sent once the `Mod:elected/3' function returns.
+%% @end
+broadcast_to_candidates(Msg, #st{leader = L, synced = Cands})
+  when L == self() ->
+    do_broadcast_(Cands, msg(from_leader, Msg));
+broadcast_to_candidates(_, _) ->
+    error(not_leader).
+
+%% ==
+
+-spec ask_candidates(any(), election()) ->
+                            {GoodReplies, Errors}
+                                when GoodReplies :: [{pid(), any()}],
+                                     Errors      :: [{pid(), any()}].
+%% @doc Send a synchronous request to all candidates.
+%%
+%% The request `Req' will be processed in `Mod:handle_call/4' and can be
+%% handled as any other request. The return value separates the good replies
+%% from the failed (the candidate died or couldn't be reached).
+%% @end
+ask_candidates(Req, #st{candidates = Cands}) ->
+    Requests =
+        lists:map(
+          fun(C) ->
+                  MRef = erlang:monitor(process, C),
+                  C ! {'$gen_call', {self(), {?MODULE, MRef}}, Req},
+                  {C, MRef}
+          end, Cands),
+    Replies = collect_replies(Requests),
+    partition(Replies).
+
+collect_replies([{Pid, MRef}|Reqs] = _L) ->
+    receive
+        {{?MODULE, MRef}, Reply} ->
+            [{Pid, true, Reply} | collect_replies(Reqs)];
+        {'DOWN', MRef, _, _, Reason} ->
+            [{Pid, false, Reason} | collect_replies(Reqs)]
+    after 1000 ->
+            [{Pid, false, timeout} | collect_replies(Reqs)]
+    end;
+collect_replies([]) ->
+    [].
+
+partition(L) ->
+    partition(L, [], []).
+
+partition([{P,Bool,R}|L], True, False) ->
+    if Bool -> partition(L, [{P,R}|True], False);
+       true -> partition(L, True, [{P,R}|False])
+    end;
+partition([], True, False) ->
+    {lists:reverse(True), lists:reverse(False)}.
+
+%% ==
+
+-spec start_link(Module::atom(), St::any()) -> {ok, pid()}.
+%% @doc Starts an anonymous locks_leader candidate using `Module' as callback.
+%%
+%% The leader candidate will sync with all candidates using the same
+%% callback module, on all connected nodes.
+%% @end
 start_link(Module, St) ->
     start_link(Module, St, []).
 
+-spec start_link(Module::atom(), St::any(), ldr_options()) -> {ok, pid()}.
+%% @doc Starts an anonymous worker or candidate.
+%%
+%% The following options are supported:
+%%
+%% * `{role, candidate | worker}' - A candidate is able to take on the
+%% leader role, if elected; a worker simply follows the elections and
+%% receives broadcasts from the leader.
+%%
+%% * `{resource, Resource}' - The name of the lock used for the election
+%% is normally `[locks_leader, Module]', but with this option, it can be
+%% changed into `[locks_leader, Resource]'. Note that, under the rules of
+%% the locks application, a lock name must be a list.
+%% @end
 start_link(Module, St, Options) ->
     proc_lib:start_link(?MODULE, init, [{Module, St, Options, self()}]).
 
+-spec start_link(Reg::atom(), Module::atom(), St::any(), ldr_options()) ->
+                        {ok, pid()}.
+%% @doc Starts a locally registered worker or candidate.
+%%
+%% Note that only one registered instance of the same name (using the
+%% built-in process registry) can exist on a given node. However, it is
+%% still possible to have multiple instances of the same election group
+%% on the same node, either anonymous, or registered under different names.
+%%
+%% For a description of the options, see {@link start_link/3}.
+%%@end
 start_link(Reg, Module, St, Options) when is_atom(Reg), is_atom(Module) ->
     proc_lib:start_link(?MODULE, init, [{Reg, Module, St, Options, self()}]).
 
 -spec leader_call(Name::server_ref(), Request::term()) -> term().
+%% @doc Make a synchronous call to the leader.
+%%
+%% This function is similar to `gen_server:call/2', but is forwarded to
+%% the leader by the leader candidate `L' (unless, of course, it is the
+%% leader, in which case it handles it directly). If the leader should die
+%% before responding, this function will raise an `error({leader_died,...})'
+%% exception.
+%% @end
 leader_call(L, Request) ->
     case catch gen_server:call(L, {'$locks_leader_call', Request}) of
 	{'$locks_leader_reply',Res} = _R ->
@@ -165,24 +325,44 @@ leader_call(L, Request) ->
 	    error({Reason, {?MODULE, leader_call, [L, Request]}})
     end.
 
+-spec leader_cast(L::server_ref(), Msg::term()) -> ok.
+%% @doc Make an asynchronous cast to the leader.
+%%
+%% This function is similar to `gen_server:cast/2', but is forwarded to
+%% the leader by the leader candidate `L' (unless, of course, it is the
+%% leader, in which case it handles it directly). No guarantee is given
+%% that the cast actually reaches the leader (i.e. if the leader dies, no
+%% attempt is made to resend to the next elected leader).
+%% @end
 leader_cast(L, Msg) ->
     ?event({leader_cast, L, Msg}),
     gen_server:cast(L, {'$leader_cast', Msg}).
 
+-spec call(L::server_ref(), Request::any()) -> any().
+%% @doc Make a `gen_server'-like call to the leader candidate `L'.
+%% @end
 call(L, Req) ->
     R = gen_server:call(L, Req),
     ?event({call_return, L, Req, R}),
     R.
 
+-spec call(L::server_ref(), Request::any(), integer()|infinity) -> any().
+%% @doc Make a timeout-guarded `gen_server'-like call to the leader
+%% candidate `L'.
+%% @end
 call(L, Req, Timeout) ->
     R = gen_server:call(L, Req, Timeout),
     ?event({call_return, L, Req, Timeout, R}),
     R.
 
+-spec cast(L::server_ref(), Msg::any()) -> ok.
+%% @doc Make a `gen_server'-like cast to the leader candidate `L'.
+%% @end
 cast(L, Msg) ->
     ?event({cast, L, Msg}),
     gen_server:cast(L, Msg).
 
+%% @private
 init({Reg, Module, St, Options, P}) ->
     register(Reg, self()),
     init_(Module, St, Options, P, Reg);
@@ -193,7 +373,8 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
     S0 = #st{},
     %% Mode = get_opt(mode, Options, S0#st.mode),
     Role = get_opt(role, Options, S0#st.role),
-    Lock = [?MODULE, get_opt(resource, Options, Module)],
+    Lock = [?MODULE, get_opt(resource, Options,
+                             default_lock(Module, Reg))],
     ModSt = try Module:init(ModSt0) of
 		{ok, MSt} -> MSt;
 		{error, Reason} ->
@@ -231,6 +412,10 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 	    ok
     end.
 
+default_lock(Mod, undefined) -> Mod;
+default_lock(Mod, Regname)   -> {Mod, Regname}.
+
+
 abort_init(Reason, Parent) ->
     proc_lib:init_ack(Parent, {error, Reason}),
     exit(Reason).
@@ -240,8 +425,12 @@ noreply(#st{leader = undefined} = S) ->
 noreply(#st{initial = false} = S) ->
     {noreply, S};
 noreply(#st{initial = true, regname = R, gen_server_opts = Opts} = S) ->
-    if R == undefined -> gen_server:enter_loop(?MODULE, Opts, S);
-       true           -> gen_server:enter_loop(?MODULE, Opts, S, R)
+    %% The very first time we're out of the safe_loop() we have to
+    %% *become* a gen_server (since we started using only proc_lib).
+    %% Set initial = false to ensure it only happens once.
+    S1 = S#st{initial = false},
+    if R == undefined -> gen_server:enter_loop(?MODULE, Opts, S1);
+       true           -> gen_server:enter_loop(?MODULE, Opts, S1, {local,R})
     end;
 noreply(Stop) when element(1, Stop) == stop ->
     Stop.
@@ -271,6 +460,13 @@ safe_loop(#st{agent = A} = S) ->
 	{?MODULE, am_worker, W} = _Msg ->
 	    ?event(_Msg, S),
 	    noreply(worker_announced(W, S));
+        {'$gen_call', {_, {?MODULE, _Ref}} = From, Req} ->
+            %% locks_leader-tagged call; handle also in safe loop
+            ?event({safe_call, Req}),
+            #st{mod = M, mod_state = MSt} = S,
+            noreply(
+              callback_reply(M:handle_call(Req, From, MSt, opaque(S)),
+                             From, fun unchanged/1, S));
 	{'DOWN',_,_,_,_} = DownMsg ->
 	    ?event(DownMsg, S),
 	    noreply(down(DownMsg, S))
@@ -279,6 +475,7 @@ safe_loop(#st{agent = A} = S) ->
 event(_Line, _Event, _State) ->
     ok.
 
+%% @private
 handle_info({nodeup, N} = _Msg, #st{role = candidate} = S) ->
     ?event({handle_info, _Msg}, S),
     noreply(nodeup(N, S));
@@ -317,6 +514,8 @@ handle_info(Msg, #st{mod = M, mod_state = MSt} = S) ->
     ?event({handle_info, Msg}, S),
     noreply(callback(M:handle_info(Msg, MSt, opaque(S)), S)).
 
+
+%% @private
 handle_cast({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
 						    leader = L} = S) ->
     if L == self() ->
@@ -328,6 +527,13 @@ handle_cast({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
 handle_cast(Msg, #st{mod = M, mod_state = MSt} = St) ->
     noreply(callback(M:handle_cast(Msg, MSt, opaque(St)), St)).
 
+
+%% @private
+handle_call(Req, {_, {?MODULE, _Ref}} = From,
+            #st{mod = M, mod_state = MSt} = S) ->
+    noreply(
+      callback_reply(M:handle_call(Req, From, MSt, opaque(S)), From,
+                    fun unchanged/1, S));
 handle_call({'$locks_leader_call', Req} = Msg, From,
 	    #st{mod = M, mod_state = MSt, leader = L,
 		buffered = Buf} = S) ->
@@ -344,11 +550,17 @@ handle_call({'$locks_leader_call', Req} = Msg, From,
 handle_call(R, F, #st{mod = M, mod_state = MSt} = S) ->
     noreply(
       callback_reply(M:handle_call(R, F, MSt, opaque(S)), F,
-		     fun(R1) -> R1 end, S)).
+                     fun unchanged/1, S)).
+		     %% fun(R1) -> R1 end, S)).
 
+unchanged(X) ->
+    X.
+
+%% @private
 terminate(_, _) ->
     ok.
 
+%% @private
 code_change(_, St, _) ->
     {ok, St}.
 
@@ -362,13 +574,23 @@ nodeup(N, #st{agent = A, candidates = Cands, lock = Lock} = S) ->
     end,
     S.
 
-locks_info(#locks_info{lock = #lock{object = Lock, queue = Q}},
-	   #st{lock = Lock} = S) ->
-    lists:foldl(fun(#r{entries = _}, _Acc) ->
-			error(illegal_read_lock);
-		   (#w{entry = #entry{client = C}}, Acc) ->
-			add_cand(C, Acc)
-		end, S, Q);
+locks_info(#locks_info{lock = #lock{object = Lock, queue = Q}} = _I,
+	   #st{lock = Lock, leader = L} = S) ->
+    S1 = lists:foldl(fun(#r{entries = _}, _Acc) ->
+                             error(illegal_read_lock);
+                        (#w{entry = #entry{client = C}}, Acc) ->
+                             add_cand(C, Acc)
+                     end, S, Q),
+    case Q of
+        [#w{entry = #entry{client = FirstC}}|_]
+          when is_pid(L), L =/= FirstC ->
+            %% We have leader contention! Can happen in the process of
+            %% netsplit recovery. Set leader = undefined to put us in
+            %% the safe loop, and wait for a new leader to be elected.
+            S1#st{leader = undefined};
+        _ ->
+            S1
+    end;
 locks_info(_, S) ->
     S.
 
@@ -413,8 +635,7 @@ maybe_announce_leader(Pid, #st{leader = L, mod = M, mod_state = MSt} = S) ->
 		{ok, MSt1} ->
 		    S#st{mod_state = MSt1};
 		{ok, Msg, MSt1} ->
-		    broadcast(S#st{mod_state = MSt1},
-			      {?MODULE, from_leader, L, Msg})
+		    do_broadcast(S#st{mod_state = MSt1}, msg(from_leader,Msg))
 	    end;
        true ->
 	    S
@@ -445,23 +666,27 @@ become_leader(#st{leader = L, mod = M, mod_state = MSt,
             {ok, Msg, MSt1}        -> {Msg , Msg , MSt1};
             {error, Reason}        -> error(Reason)
         end,
-    AmLeader = {?MODULE, am_leader, self(), AmLeaderMsg},
-    FromLeader = {?MODULE, from_leader, self(), FromLeaderMsg},
-    broadcast_(NewCands, AmLeader),
-    broadcast_(NewWs, AmLeader),
-    broadcast_(Synced, FromLeader),
-    broadcast_(SyncedWs, FromLeader),
+    AmLeader = msg(am_leader, AmLeaderMsg),
+    FromLeader = msg(from_leader, FromLeaderMsg),
+    do_broadcast_(NewCands, AmLeader),
+    do_broadcast_(NewWs, AmLeader),
+    do_broadcast_(Synced, FromLeader),
+    do_broadcast_(SyncedWs, FromLeader),
     S#st{mod_state = ModSt1, synced = Cands, synced_workers = Ws};
 become_leader(#st{mod = M, mod_state = MSt} = S) ->
     ?event(become_leader, S),
     case M:elected(MSt, opaque(S), undefined) of
 	{ok, Msg, MSt1} ->
-	    broadcast(S#st{mod_state = MSt1, leader = self(),
-                           synced = S#st.candidates},
-		      {?MODULE, am_leader, self(), Msg});
+	    do_broadcast(S#st{mod_state = MSt1, leader = self(),
+                              synced = S#st.candidates}, msg(am_leader,Msg));
 	{error, Reason} ->
 	    error(Reason)
     end.
+
+msg(from_leader, Msg) ->
+    {?MODULE, from_leader, self(), Msg};
+msg(am_leader, Msg) ->
+    {?MODULE, am_leader, self(), Msg}.
 
 %% opaque(#st{candidates = Cands, workers = Ws, leader = L}) ->
 %%     fun(candidates) -> Cands;
@@ -477,7 +702,7 @@ callback({ok, MSt}, S) ->
     S#st{mod_state = MSt};
 callback({ok, Msg, MSt}, #st{leader = L} = S) ->
     if L == self() ->
-	    broadcast(S#st{mod_state = MSt}, Msg);
+	    do_broadcast(S#st{mod_state = MSt}, msg(from_leader, Msg));
        true ->
 	    error(not_leader)
     end;
@@ -491,7 +716,7 @@ callback_reply({reply, Reply, MSt}, From, F, S) ->
 callback_reply({reply, Reply, Msg, MSt}, From, F, S) ->
     if S#st.leader == self() ->
 	    S1 = S#st{mod_state = MSt},
-	    broadcast(S1, Msg),
+	    do_broadcast(S1, msg(from_leader, Msg)),
 	    gen_server:reply(From, F(Reply)),
 	    S1;
        true ->
@@ -505,11 +730,11 @@ callback_reply({stop, Reason, Reply, MSt}, From, F, S) ->
 callback_reply({stop, Reason, MSt}, _, _, S) ->
     {stop, Reason, S#st{mod_state = MSt}}.
 
-broadcast(#st{candidates = Cands, workers = Ws} = S, Msg) ->
-    broadcast_(Cands ++ Ws, Msg),
+do_broadcast(#st{candidates = Cands, workers = Ws} = S, Msg) ->
+    do_broadcast_(Cands ++ Ws, Msg),
     S.
 
-broadcast_(Pids, Msg) when is_list(Pids) ->
+do_broadcast_(Pids, Msg) when is_list(Pids) ->
     [P ! Msg || P <- Pids],
     ok.
 
@@ -521,16 +746,9 @@ from_leader(_OtherL, _Msg, S) ->
 
 leader_announced(L, Msg, #st{leader = L, mod = M, mod_state = MSt} = S) ->
     callback(M:surrendered(MSt, Msg, opaque(S)), S);
-leader_announced(L, Msg, #st{leader = OldLeader,
-			     mod = M, mod_state = MSt} = S) ->
+leader_announced(L, Msg, #st{mod = M, mod_state = MSt} = S) ->
     Ref = erlang:monitor(process, L),
     put({?MODULE,monitor,Ref}, candidate),
-    if OldLeader == self() ->
-	    %% split brain
-	    io:fwrite("Split brain detected! (leader = ~p)~n", [L]);
-       true ->
-	    ok
-    end,
     S1 = S#st{leader = L},
     callback(M:surrendered(MSt, Msg, opaque(S1)), S1).
 
