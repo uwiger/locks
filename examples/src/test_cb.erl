@@ -142,21 +142,6 @@ merge_dicts(D, I) ->
 	      io:fwrite("merge: got ~p from ~w~n", [false, C]),
 	      Acc
       end, D, Good).
-%% merge_dicts([C|Cands], D) ->
-%%     try gen_server:call(C, merge, 3000) of
-%% 	{true, D2} ->
-%% 	    io:fwrite("merge: got ~p from ~w~n", [dict:to_list(D2),C]),
-%% 	    merge_dicts(Cands, dict:merge(fun(_K,V1,_) -> V1 end, D, D2));
-%% 	false ->
-%% 	    merge_dicts(Cands, D)
-%%     catch
-%% 	Cat:R ->
-%% 	    io:fwrite("merge with ~w failed: ~w:~p~n", [C, Cat, R]),
-%% 	    merge_dicts(Cands, D)
-%%     end;
-%% merge_dicts([], D) ->
-%%     io:fwrite("merged D = ~p~n", [D]),
-%%     D.
 
 
 %% @spec surrendered(State::state(), Synch::broadcast(), I::info()) ->
@@ -265,8 +250,8 @@ handle_leader_cast(_Msg, S, _I) ->
 %% @end
 from_leader({sync, D}, #st{} = S, _I) ->
     {ok, S#st{dict = D}};
-from_leader({store,F} = Op, #st{dict = Dict} = S, I) ->
-    io:fwrite("from_leader(~p, Dict, ~p)~n", [Op, I]),
+from_leader({store,F} = Op, #st{dict = Dict} = S, _I) ->
+    io:fwrite("from_leader(~p, Dict, I)~n", [Op]),
     NewDict = F(Dict),
     {ok, S#st{dict = NewDict}}.
 
