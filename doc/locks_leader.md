@@ -165,7 +165,7 @@ server_ref() = atom() | pid()
 
 
 <table width="100%" border="1" cellspacing="0" cellpadding="2" summary="function index"><tr><td valign="top"><a href="#ask_candidates-2">ask_candidates/2</a></td><td>Send a synchronous request to all candidates.</td></tr><tr><td valign="top"><a href="#broadcast-2">broadcast/2</a></td><td>Broadcast <code>Msg</code> to all candidates and workers.</td></tr><tr><td valign="top"><a href="#broadcast_to_candidates-2">broadcast_to_candidates/2</a></td><td>Broadcast <code>Msg</code> to all (synced) candidates.</td></tr><tr><td valign="top"><a href="#call-2">call/2</a></td><td>Make a <code>gen_server</code>-like call to the leader candidate <code>L</code>.</td></tr><tr><td valign="top"><a href="#call-3">call/3</a></td><td>Make a timeout-guarded <code>gen_server</code>-like call to the leader
-candidate <code>L</code>.</td></tr><tr><td valign="top"><a href="#candidates-1">candidates/1</a></td><td>Return the current list of candidates.</td></tr><tr><td valign="top"><a href="#cast-2">cast/2</a></td><td>Make a <code>gen_server</code>-like cast to the leader candidate <code>L</code>.</td></tr><tr><td valign="top"><a href="#leader-1">leader/1</a></td><td>Return the leader pid, or <code>undefined</code> if there is no current leader.</td></tr><tr><td valign="top"><a href="#leader_call-2">leader_call/2</a></td><td>Make a synchronous call to the leader.</td></tr><tr><td valign="top"><a href="#leader_cast-2">leader_cast/2</a></td><td>Make an asynchronous cast to the leader.</td></tr><tr><td valign="top"><a href="#leader_node-1">leader_node/1</a></td><td>Return the node of the current leader.</td></tr><tr><td valign="top"><a href="#new_candidates-1">new_candidates/1</a></td><td>Return the current list of candidates that have not yet been synced.</td></tr><tr><td valign="top"><a href="#reply-2">reply/2</a></td><td>Corresponds to <code>gen_server:reply/2</code>.</td></tr><tr><td valign="top"><a href="#start_link-2">start_link/2</a></td><td>Starts an anonymous locks_leader candidate using <code>Module</code> as callback.</td></tr><tr><td valign="top"><a href="#start_link-3">start_link/3</a></td><td>Starts an anonymous worker or candidate.</td></tr><tr><td valign="top"><a href="#start_link-4">start_link/4</a></td><td>Starts a locally registered worker or candidate.</td></tr><tr><td valign="top"><a href="#workers-1">workers/1</a></td><td>Return the current list of workers.</td></tr></table>
+candidate <code>L</code>.</td></tr><tr><td valign="top"><a href="#candidates-1">candidates/1</a></td><td>Return the current list of candidates.</td></tr><tr><td valign="top"><a href="#cast-2">cast/2</a></td><td>Make a <code>gen_server</code>-like cast to the leader candidate <code>L</code>.</td></tr><tr><td valign="top"><a href="#leader-1">leader/1</a></td><td>Return the leader pid, or <code>undefined</code> if there is no current leader.</td></tr><tr><td valign="top"><a href="#leader_call-2">leader_call/2</a></td><td>Make a synchronous call to the leader.</td></tr><tr><td valign="top"><a href="#leader_cast-2">leader_cast/2</a></td><td>Make an asynchronous cast to the leader.</td></tr><tr><td valign="top"><a href="#leader_node-1">leader_node/1</a></td><td>Return the node of the current leader.</td></tr><tr><td valign="top"><a href="#leader_reply-2">leader_reply/2</a></td><td></td></tr><tr><td valign="top"><a href="#new_candidates-1">new_candidates/1</a></td><td>Return the current list of candidates that have not yet been synced.</td></tr><tr><td valign="top"><a href="#reply-2">reply/2</a></td><td>Corresponds to <code>gen_server:reply/2</code>.</td></tr><tr><td valign="top"><a href="#start_link-2">start_link/2</a></td><td>Starts an anonymous locks_leader candidate using <code>Module</code> as callback.</td></tr><tr><td valign="top"><a href="#start_link-3">start_link/3</a></td><td>Starts an anonymous worker or candidate.</td></tr><tr><td valign="top"><a href="#start_link-4">start_link/4</a></td><td>Starts a locally registered worker or candidate.</td></tr><tr><td valign="top"><a href="#workers-1">workers/1</a></td><td>Return the current list of workers.</td></tr></table>
 
 
 <a name="functions"></a>
@@ -363,6 +363,13 @@ Return the node of the current leader.
 
 
 This function is mainly present for compatibility with `gen_leader`.
+<a name="leader_reply-2"></a>
+
+### leader_reply/2 ###
+
+`leader_reply(From, Reply) -> any()`
+
+
 <a name="new_candidates-1"></a>
 
 ### new_candidates/1 ###
