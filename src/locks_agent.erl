@@ -453,7 +453,7 @@ union(A, B) ->
 
 %% @private
 handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, S0) ->
-    ?dbg("~p: handle_info(~p~n", [self(), _I]),
+    ?dbg("~p: handle_info(~p~n", [self(), I]),
     LockID = {Lock0#lock.object, Node},
     Lock = Lock0#lock{object = LockID},
     State = check_note(Note, LockID, S0),
@@ -561,9 +561,11 @@ request_can_be_served(Obj, #state{down = Down, requests = Reqs}) ->
     end.
 
 handle_nodedown(Node, #state{down = Down, requests = Reqs,
-                             monitored = Mon} = S) ->
+                             monitored = Mon, locks = Locks} = S) ->
+    ?dbg("~p: handle_nodedown (~p)~n", [self(), Node]),
+    Locks1 = [L || #lock{object = {_Oid, N}} = L <- Locks, N =/= Node],
     Down1 = [Node|Down -- [Node]],
-    S1 = S#state{down = Down1},
+    S1 = S#state{down = Down1, locks = Locks1},
     case [R#req.object || #req{nodes = Ns} = R <- Reqs,
                           lists:member(Node, Ns)] of
         [] ->
