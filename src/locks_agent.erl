@@ -335,22 +335,7 @@ init(Opts) ->
 handle_call(lock_info, _From, #state{locks = Locks,
                                      pending = Pending} = State) ->
     {reply, {Pending, Locks}, State};
-handle_call({prepare, Ops}, {Client, _}, State)
-  when Client =:= ?myclient ->
-    case waitingfor(State) of
-        [] ->
-            case check_prepare(Ops, State) of
-                {ok, State1} -> {reply, ok, State1}
-              %% ; {error, Reason} ->
-              %%       %% Automatically abort
-              %%       gen_server:reply(
-              %%         From, Err = {abort, {prepare_error, Reason}}),
-              %%       {stop, Err, State}
-            end;
-        [_|_] ->
-            {reply, {error, awaiting_locks}, State}
-    end;
-handle_call(await_all_locks, {Client, Tag}, State) when Client =:= ?myclient ->
+handle_call(await_all_locks, {Client, Tag}, State) ->
     ?dbg("~p: await_all_locks(~p)~n"
 	 "Reqs = ~p; Locks = ~p~n",
          [self(), Client,
@@ -767,11 +752,6 @@ code_change(_FromVsn, State, _Extra) ->
     {ok, State}.
 
 %%%%%%%%%%%%%%%%%%% data manipulation %%%%%%%%%%%%%%%%%%%
-
-%% Not yet implemented. The idea is to check whether conditions are met
-%% for a certain operation (e.g. commit).
-check_prepare(_Ops, State) ->
-    {ok, State}.
 
 -spec all_locks_status(#state{}) ->
                               no_locks | waiting | {have_all, deadlocks()}
