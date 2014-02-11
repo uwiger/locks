@@ -245,10 +245,12 @@ ask_candidates(Req, #st{candidates = Cands}) ->
 collect_replies([{Pid, MRef}|Reqs] = _L) ->
     receive
         {{?MODULE, MRef}, Reply} ->
+            erlang:demonitor(MRef, [flush]),
             [{Pid, true, Reply} | collect_replies(Reqs)];
         {'DOWN', MRef, _, _, Reason} ->
             [{Pid, false, Reason} | collect_replies(Reqs)]
     after 1000 ->
+            erlang:demonitor(MRef, [flush]),
             [{Pid, false, timeout} | collect_replies(Reqs)]
     end;
 collect_replies([]) ->
