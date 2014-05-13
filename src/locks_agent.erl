@@ -293,6 +293,7 @@ lock_objects(Agent, Objects) ->
 lock_info(Agent) ->
     call(Agent, lock_info).
 
+
 call(A, Req) ->
     call(A, Req, 5000).
 
@@ -350,8 +351,8 @@ handle_call(R, _, State) ->
 
 %% @private
 handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
-            #state{requests = Reqs} = State)
-  when Client==?myclient ->
+            #state{requests = Reqs} = State) ->
+    %%
     ?dbg("~p: Req = ~p~n", [self(), _Request]),
     case lists:keyfind(Object, #req.object, Reqs) of
         false ->
@@ -940,4 +941,3 @@ max_agent([{A1, O1}, {A2, _O2} | Rest]) when A1 > A2 ->
     max_agent([{A1, O1} | Rest]);
 max_agent([{_A1, _O1}, {A2, O2} | Rest]) ->
     max_agent([{A2, O2} | Rest]).
-
