@@ -421,6 +421,8 @@ new_request(Object, Mode, Nodes, Require, #state{requests = Reqs} = State) ->
                 OID, Mode, ensure_monitor(Node, Sx))
       end, State#state{requests = [Req|Reqs]}, Nodes).
 
+
+
 add_nodes(Nodes, #req{object = Object, mode = Mode, nodes = OldNodes} = Req,
           #state{requests = Reqs} = State) ->
     AllNodes = union(Nodes, OldNodes),
@@ -786,7 +788,9 @@ all_locks_status(#state{pending = Pending} = State) ->
 %%
 -spec outdated(#state{}, #lock{}) -> boolean().
 outdated(State, Lock) ->
-    any(fun(L) -> newer(L, Lock) end, State#state.locks).
+    Res = any(fun(L) -> newer(L, Lock) end, State#state.locks),
+    ?dbg("outdated(Lock=~p) -> ~p~n", [Lock, Res]),
+    Res.
 
 -spec newer(#lock{}, #lock{}) -> boolean().
 newer(Lock1, Lock2) ->
@@ -798,40 +802,68 @@ waiting_for_ack(#state{sync = Sync}, LockID) ->
     lists:member(LockID, Sync).
 
 -spec waitingfor(#state{}) -> [lock_id()].
-waitingfor(#state{locks = Locks, pending = Pending, requests = Reqs,
+waitingfor(#state{locks = Locks, requests = Reqs,
                   down = Down}) ->
-    HaveLocks = [L#lock.object || L <- Locks,
-                                  in(self(), hd(L#lock.queue))],
-    PendingTrimmed =
+    HaveLocks = [{L#lock.object, l_mode(Q)} || #lock{queue = Q} = L <- Locks,
+                                               in(self(), hd(Q))],
+    PendingOIDs =
         lists:foldl(
-          fun(#req{object = OID, require = majority, nodes = Ns}, Acc) ->
-                  NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
+          fun(#req{object = OID, mode = M,
+                   require = majority, nodes = Ns}, Acc) ->
+                  NodesLocked = [N || {{O,N},M1} <- HaveLocks,
+                                      O == OID andalso l_covers(M, M1)],
                   case length(NodesLocked) > (length(Ns) div 2) of
                       true ->
-                          [ID || {O,_} = ID <- Acc, O =/= OID];
+                          ordsets:add_element(OID, Acc);
                       false ->
                           Acc
                   end;
-             (#req{object = OID, require = majority_alive, nodes = Ns}, Acc) ->
+             (#req{object = OID, mode = M,
+                   require = majority_alive, nodes = Ns}, Acc) ->
                   Alive = Ns -- Down,
-                  NodesLocked = [N || {O,N} <- HaveLocks, O == OID],
+                  NodesLocked = [N || {{O,N},M1} <- HaveLocks,
+                                      O == OID andalso l_covers(M,M1)],
                   case length(NodesLocked) > (length(Alive) div 2) of
                       true ->
-                          [ID || {O,_} = ID <- Acc, O =/= OID];
+                          ordsets:add_element(OID, Acc);
                       false ->
                           Acc
                   end;
-             (#req{object = OID, require = any, nodes = Ns}, Acc) ->
-                  case [1 || {O,N} <- HaveLocks, O == OID, member(N, Ns)] of
+             (#req{object = OID, mode = M, require = any, nodes = Ns}, Acc) ->
+                  case [1 || {{O,N}, M1} <- HaveLocks,
+                             O == OID
+                                 andalso l_covers(M,M1)
+                                 andalso member(N, Ns)] of
                       [] -> Acc;
                       [_|_] ->
-                          [ID || {O,_} = ID <- Acc, O =/= OID]
+                          ordsets:add_element(OID, Acc)
+                  end;
+             (#req{object = OID, mode = M, require = all, nodes = Ns}, Acc) ->
+                  case [N || N <- Ns,
+                             l_on_node(OID, N, M, HaveLocks)] of
+                      Ns -> Acc;
+                      _ ->
+                          ordsets:add_element(OID, Acc)
                   end;
              (_, Acc) ->
                   Acc
-          end, Pending, Reqs),
+          end, ordsets:new(), Reqs),
     ?dbg("~p: HaveLocks = ~p~n", [self(), HaveLocks]),
-    PendingTrimmed -- HaveLocks.
+    PendingOIDs.
+
+l_mode([#r{}|_]) -> read;
+l_mode([#w{}|_]) -> write.
+
+l_covers(read, write) -> true;
+l_covers(M   , M    ) -> true;
+l_covers(_   , _    ) -> false.
+
+l_on_node(O, N, write, HaveLocks) ->
+    lists:member({{O,N},write}, HaveLocks);
+l_on_node(O, N, read, HaveLocks) ->
+    lists:member({{O,N},read}, HaveLocks)
+        orelse lists:member({{O,N},write}, HaveLocks).
+
 
 i_add_lock(#state{locks = Locks, sync = Sync} = State,
            #lock{object = Obj} = Lock) ->
@@ -860,10 +892,8 @@ interesting(#state{locks = Locks}, #lock{queue = Q}, Agent) ->
 
 is_member(A, [#r{entries = Es}|T]) ->
     lists:keymember(A, #entry.agent, Es) orelse is_member(A, T);
-is_member(A, [#w{entry = #entry{agent = A}}|_]) ->
-    true;
-is_member(A, [_|T]) ->
-    is_member(A, T);
+is_member(A, [#w{entries = Es}|T]) ->
+    lists:keymember(A, #entry.agent, Es) orelse is_member(A, T);
 is_member(_, []) ->
     false.
 
@@ -874,13 +904,13 @@ flatten_queue(Q) ->
 %% it returns a flat list of #entry{} records from the queue.
 flatten_queue([#r{entries = Es}|Q], Acc) ->
     flatten_queue(Q, Es ++ Acc);
-flatten_queue([#w{entry = E}|Q], Acc) ->
-    flatten_queue(Q, [E|Acc]);
+flatten_queue([#w{entries = Es}|Q], Acc) ->
+    flatten_queue(Q, Es ++ Acc);
 flatten_queue([], Acc) ->
     Acc.
 
-uniq(L) ->
-    ordsets:from_list(L).
+uniq([_] = L) -> L;
+uniq(L)       -> ordsets:from_list(L).
 
 %% analyse computes whether a local deadlock can be detected,
 %% if not, 'ok' is returned, otherwise it returns the triple
@@ -900,6 +930,7 @@ analyse_(Locks) ->
 		lists:any(
 		  fun(#lock{object = Obj, queue = Queue}) ->
                           (O1==Obj)
+                              andalso A1 =/= A2
                               andalso in(A1, hd(Queue))
 			      andalso in_tail(A2, tl(Queue))
 		  end, Locks)
@@ -913,8 +944,8 @@ analyse_(Locks) ->
 	    {deadlock, ToSurrender, ToObject}
     end.
 
-expand_agents([{#w{entry = #entry{agent = A}}, Id} | T]) ->
-    [{A, Id} | expand_agents(T)];
+expand_agents([{#w{entries = Es}, Id} | T]) ->
+    expand_agents_(Es, Id, T);
 expand_agents([{#r{entries = Es}, Id} | T]) ->
     expand_agents_(Es, Id, T);
 expand_agents([]) ->
@@ -927,8 +958,8 @@ expand_agents_([], _, Tail) ->
 
 in(A, #r{entries = Entries}) ->
     lists:keymember(A, #entry.agent, Entries);
-in(A, #w{entry = #entry{agent = A1}}) ->
-    A =:= A1.
+in(A, #w{entries = Entries}) ->
+    lists:keymember(A, #entry.agent, Entries).
 
 in_tail(A, Tail) ->
     lists:any(fun(X) ->

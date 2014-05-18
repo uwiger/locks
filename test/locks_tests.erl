@@ -98,10 +98,14 @@ lock_upgrade2() ->
     L1 = [?MODULE, ?LINE],
     L2 = L1 ++ [1],
     script([1,2],
-           [{1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
+           [% {1, ?LINE, trace, true},
+            {2, ?LINE, trace, true},
+            {1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
             {2, ?LINE, locks, lock, ['$agent', L2, read], match({ok,[]})},
             {1, ?LINE, locks, lock, ['$agent', L1, write], 100,
              match(timeout, timeout)},
+            {1, ?LINE, trace, false},
+            {2, ?LINE, trace, false},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {1, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
@@ -292,30 +296,51 @@ client_apply(M, F, A) ->
         erase(client_call)
     end.
 
-eval_script([E|S], Agents) ->
-    Agents1 = ask_agent(E, Agents),
-    eval_script(S, Agents1);
-eval_script([], Agents) ->
+eval_script(Scr, Agents) ->
+    eval_script(Scr, Agents, []).
+
+eval_script([E|S], Agents, Acc) ->
+    {Res, Agents1} =
+        try  ask_agent(E, Agents)
+        catch
+            error:Reason ->
+                io:fwrite(user, ("ERROR: ~p~n"
+                                 "Script: ~p~n"),
+                          [Reason,
+                           lists:reverse([{E, {'EXIT', Reason}}|Acc])]),
+                error(Reason)
+        end,
+    eval_script(S, Agents1, [{E, Res}|Acc]);
+
+eval_script([], Agents, Acc) ->
     Remain = [A || {_, Pid, _, _} = A <- Agents,
                    is_process_alive(Pid)],
-    [] = Remain,
-    ok.
+    case Remain of
+        [] -> ok;
+        [_|_] ->
+            io:fwrite(user, ("REMAINING: ~p~n"
+                             "Script: ~p~n"), [Remain, lists:reverse(Acc)]),
+            error({remaining, Remain})
+    end.
 
 ask_agent({A, _L, trace, Bool}, Agents) ->
     {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
     if Bool ->
-            dbg:tracer(),
-            dbg:tpl(locks_agent, x),
-            dbg:p([Pid, APid], [c,m]);
+            io:fwrite(user,
+                      "Trace on ~p:~n~p~n",
+                      [A, [dbg:tracer(),
+                           dbg:tpl(locks_agent, x),
+                           dbg:p(Pid, [c,m]),
+                           dbg:p(APid, [c,m])]]);
        true ->
             dbg:ctpl(locks_agent),
             dbg:stop()
     end,
-    Agents;
+    {ok, Agents};
 ask_agent({A, _L, info, Fmt, Args}, Agents) ->
     {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
     ?debugFmt("(INFO ~p/~p): " ++ Fmt, [Pid,APid|Args]),
-    Agents;
+    {ok, Agents};
 ask_agent({A, L, M, F, Args, Match}, Agents) ->
     ask_agent({A, L, M, F, Args, infinity, Match}, Agents);
 ask_agent({A, _, M, F, Args, Timeout, Match} = _E, Agents) ->
@@ -324,7 +349,7 @@ ask_agent({A, _, M, F, Args, Timeout, Match} = _E, Agents) ->
     {C, Res} = ask_client(Pid, M, F, Args, Timeout),
     io:fwrite(user, "~p -> ~p:~p~n", [_E, C, Res]),
     St1 = Match(C, Res, St),
-    lists:keyreplace(A, 1, Agents, {A, Pid, APid, St1}).
+    {Res, lists:keyreplace(A, 1, Agents, {A, Pid, APid, St1})}.
 
 repl_agent(Pid, Args) ->
     lists:map(fun('$agent') -> Pid;
@@ -337,11 +362,15 @@ match(Const) ->
 match(Catch, Const) ->
     if Const == '_' ->
             fun(Ca, _, St) when Ca == Catch ->
-                    St
+                    St;
+               (C, Res, St) ->
+                    error({mismatch, [C, Res, Catch, St]})
             end;
        true ->
             fun(Ca, Co, St) when Ca == Catch, Co == Const ->
-                    St
+                    St;
+               (Ca, Co, St) ->
+                    error({mismatch, [Ca, Co, Catch, St]})
             end
     end.
 

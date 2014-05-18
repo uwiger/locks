@@ -48,7 +48,7 @@
 	 }).
 
 -record(w, {
-	  entry   :: #entry{}
+	  entries = []     :: [#entry{}]
 	 }).
 
 -record(r, {
@@ -69,4 +69,3 @@
 	  note = []}).
 
 -define(LOCKER, locks_server).
-

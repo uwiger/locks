@@ -204,8 +204,8 @@ queue_entries(Q) ->
 
 queue_entries_([#r{entries = Es}|Q]) ->
     Es ++ queue_entries_(Q);
-queue_entries_([#w{entry = E}|Q]) ->
-    [E|queue_entries_(Q)];
+queue_entries_([#w{entries = Es}|Q]) ->
+    Es ++ queue_entries_(Q);
 queue_entries_([]) ->
     [].
 
@@ -260,8 +260,8 @@ flatten_queue(Q) ->
 %% it returns a flat list of #entry{} records from the queue.
 flatten_queue([#r{entries = Es}|Q], Acc) ->
     flatten_queue(Q, Es ++ Acc);
-flatten_queue([#w{entry = E}|Q], Acc) ->
-    flatten_queue(Q, [E|Acc]);
+flatten_queue([#w{entries = Es}|Q], Acc) ->
+    flatten_queue(Q, Es ++ Acc);
 flatten_queue([], Acc) ->
     Acc.
 
@@ -277,8 +277,8 @@ fold_lock_queue(F, Acc, LockID) ->
 
 fold_queue(F, Acc, [#r{entries = Es}|Q]) ->
     fold_queue(F, lists:foldl(F, Acc, Es), Q);
-fold_queue(F, Acc, [#w{entry = E}|Q]) ->
-    fold_queue(F, F(E, Acc), Q);
+fold_queue(F, Acc, [#w{entries = Es}|Q]) ->
+    fold_queue(F, lists:foldl(F, Acc, Es), Q);
 fold_queue(_, Acc, []) ->
     Acc.
 
@@ -297,13 +297,16 @@ do_surrender(ID, Tid, {Locks, _Tids}) ->
     ets:insert(Locks, Updated),
     Updated.
 
-has_lock([#w{entry = #entry{agent = A1}}|_], A) ->
+has_lock([#w{entries = [#entry{agent = A1}]}|_], A) ->
     A1 =:= A;
 has_lock([#r{entries = Es}|_], A) ->
-    lists:keymember(A, #entry.agent, Es).
+    lists:keymember(A, #entry.agent, Es);
+has_lock(_, _) ->
+    false.
 
-move_to_last([#w{entry = #entry{agent = A} = E}|T], A, V) ->
-    T ++ [#w{entry = E#entry{version = V}}];
+
+move_to_last([#w{entries = [#entry{agent = A} = E]}|T], A, V) ->
+    T ++ [#w{entries = [E#entry{version = V}]}];
 move_to_last([#r{entries = [#entry{agent = A} = E]}|T], A, V) ->
     append_read_entry(T, E#entry{version = V});
 move_to_last([#r{entries = Es} = R | T], A, V) ->
@@ -358,10 +361,17 @@ do_remove_agent_([{A, ID}|T], Locks, Acc) ->
 		   fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
 			   Acc1;
 		      (#r{entries = Es}, Acc1) ->
-			   [#r{entries = lists:keydelete(A, #entry.agent, Es)}
-			    | Acc1];
-		      (#w{entry = #entry{agent = Ax}}, Acc1) when Ax == A ->
-			   Acc1;
+                           case lists:keydelete(A, #entry.agent, Es) of
+                               [] -> Acc1;
+                               Es1 ->
+                                   [#w{entries = Es1} | Acc1]
+                           end;
+                      (#w{entries = Es}, Acc1) ->
+                           case lists:keydelete(A, #entry.agent, Es) of
+                               [] -> Acc1;
+                               Es1 ->
+                                   [#w{entries = Es1} | Acc1]
+                           end;
 		      (E, Acc1) ->
 			   [E|Acc1]
 		   end, [], Q),
@@ -408,7 +418,7 @@ insert_agent([], ID, A, Client, Mode, Vsn) ->
     Entry = #entry{agent = A, client = Client, version = Vsn},
     Q  = case Mode of
 	     read -> [#r{entries = [Entry]}];
-	     write -> [#w{entry = Entry}]
+	     write -> [#w{entries = [Entry]}]
 	 end,
     L = #lock{object = ID, version = Vsn, queue = Q},
     {false, [L]};
@@ -448,7 +458,13 @@ insert_agent([_|_] = Related, ID, A, Client, Mode, Vsn) ->
 					  Entry#entry{type = direct})}
 			  | Children1]};
 		true ->
-		    {false, []}
+                    %% We may still need to refresh. Assume that the agent
+                    %% requires an update (very true on lock upgrade)
+		    {false, [Mine#lock{version = Vsn,
+                                       queue =
+                                           into_queue(
+                                             Mode, Queue,
+                                             Entry#entry{type = direct})}]}
 	    end
     end.
 
@@ -462,11 +478,10 @@ in_queue([], _, _) ->
 
 in_queue_(#r{entries = Entries}, A, read) ->
     lists:keymember(A, #entry.agent, Entries);
-in_queue_(#w{entry = #entry{agent = A1}}, A, M) when M==read; M==write ->
-    A == A1;
+in_queue_(#w{entries = Es}, A, M) when M==read; M==write ->
+    lists:keymember(A, #entry.agent, Es);
 in_queue_(_, _, _) ->
     false.
-
 
 into_queue(read, [#r{entries = Entries}] = Q, Entry) ->
     %% No pending write locks
@@ -478,20 +493,30 @@ into_queue(read, [#r{entries = Entries}] = Q, Entry) ->
 into_queue(read,  [], Entry) ->
     [#r{entries = [Entry]}];
 into_queue(write, [], Entry) ->
-    [#w{entry = Entry}];
+    [#w{entries = [Entry]}];
 into_queue(write, [#r{entries = [Er]} = H], Entry) ->
     if Entry#entry.agent == Er#entry.agent ->
 	    %% upgrade to write lock
-	    [#w{entry = Entry}];
+	    [#w{entries = [Entry]}];
        true ->
-	    [H, #w{entry = Entry}]
+	    [H, #w{entries = [Entry]}]
     end;
-into_queue(write, [#r{entries = Es} = H|T], #entry{agent = A} = Entry) ->
-    H1 = case lists:keymember(A, #entry.agent, Es) of
-	     true -> H#r{entries = lists:keydelete(A, #entry.agent, Es)};
-	     false -> H
-	 end,
-    [H1 | into_queue(write, T, Entry)];
+into_queue(write, [#w{entries = [#entry{agent = A}]}],
+           #entry{agent = A, type = direct} = Entry) ->
+    %% Refresh and ensure it's a direct lock
+    [#w{entries = [Entry]}];
+into_queue(Type, [H|T], #entry{agent = A, type = direct} = Entry) ->
+    case H of
+        #w{entries = Es} when Type == write; Type == read ->
+            %% If a matching entry exists, we set to new version and
+            %% set type to direct. This means we might get a direct write
+            %% lock even though we asked for a read lock.
+            maybe_refresh(Es, H, T, Type, A, Entry);
+        #r{entries = Es} when Type == read ->
+            maybe_refresh(Es, H, T, Type, A, Entry);
+        _ ->
+            [H | into_queue(Type, T, Entry)]
+    end;
 into_queue(Type, [H|T] = Q, Entry) ->
     case in_queue_(H, Entry#entry.agent, Type) of
 	false ->
@@ -499,6 +524,21 @@ into_queue(Type, [H|T] = Q, Entry) ->
 	true ->
 	    Q
     end.
+
+maybe_refresh(Es, H, T, Type, A, Entry) ->
+    case lists:keyfind(A, #entry.agent, Es) of
+        #entry{} = E ->
+            Es1 = lists:keyreplace(A, #entry.agent, Es,
+                                   E#entry{type = Entry#entry.type,
+                                           version = Entry#entry.version}),
+            case H of
+                #w{} -> [H#w{entries = Es1} | T];
+                #r{} -> [H#r{entries = Es1} | T]
+            end;
+        false ->
+            [H | into_queue(Type, T, Entry)]
+    end.
+
 
 append_entry([#lock{queue = Q} = H|T], Entry, Mode, Vsn) ->
     [H#lock{version = Vsn, queue = into_queue(Mode, Q, Entry)}
@@ -531,6 +571,7 @@ update_children(Children, Entry, Mode, Vsn) ->
 
 update_children([#lock{queue = Q} = H | T], Entry, Mode, Vsn, Acc, QAcc) ->
     QAcc1 = merge_queue(Q, QAcc),
+    ?dbg("merge_queue(~p, ~p) -> ~p~n", [Q, QAcc, QAcc1]),
     Acc1 = [H#lock{version = Vsn,
 		   queue = into_queue(Mode, Q, Entry)} | Acc],
     if T == [] ->
@@ -544,17 +585,29 @@ merge_queue([H|T], Q) ->
 merge_queue([], Q) ->
     Q.
 
-set_indirect(#w{entry = #entry{} = E} = W) ->
-    W#w{entry = E#entry{type = indirect}};
+set_indirect(#w{entries = Es} = W) ->
+    W#w{entries = [E#entry{type = indirect} || E <- Es]};
 set_indirect(#r{entries = Es} = R) ->
     R#r{entries = [E#entry{type = indirect} || E <- Es]}.
 
-sort_insert(#w{entry = #entry{agent = A, version = Vsn}},
-	    [#w{entry = #entry{agent = A, version = Vsn2} = E} = W | T]) ->
-    [W#w{entry = E#entry{version = erlang:max(Vsn, Vsn2)}} | T];
-sort_insert(#r{entries = Esa},
-	    [#r{entries = Esb} = R | T]) ->
+sort_insert(#w{entries = Esa}, [#w{entries =Esb} = W | T]) ->
+    [W#w{entries = sort_insert_entries(Esa, Esb)} | T];
+sort_insert(#r{entries = Esa}, [#r{entries = Esb} = R | T]) ->
     [R#r{entries = sort_insert_entries(Esa, Esb)} | T];
+sort_insert(#r{entries = Esr} = R, [#w{entries = Esw} = W | T]) ->
+    case upgrade_entries(Esr, Esw) of
+        {[], Esw1} ->
+            [W#w{entries = Esw1} | T];
+        {Esr1, Esw1} ->
+            [W#w{entries = Esw1} | sort_insert(R#r{entries = Esr1}, T)]
+    end;
+sort_insert(#w{entries = Esw} = W, [#r{entries = Esr} = R | T]) ->
+    case upgrade_entries(Esr, Esw) of
+        {[], Esw1} ->
+            [W#w{entries = Esw1} | T];
+        {Esr1, Esw1} ->
+            [R#r{entries = Esr1} | sort_insert(W#w{entries = Esw1}, T)]
+    end;
 sort_insert(E, [H|T]) ->
     [H|sort_insert(E, T)];
 sort_insert(E, []) ->
@@ -572,6 +625,24 @@ sort_insert_entries([#entry{agent = A, version = Vsn} = En|T], Es) ->
 sort_insert_entries([], Es) ->
     Es.
 
+upgrade_entries(Esr, Esw) ->
+    R = upgrade_entries(Esr, Esw, []),
+    ?dbg("upgrade_entries(~p, ~p) -> ~p~n", [Esr, Esw, R]),
+    R.
+
+%% The order of the lists don't matter, so we don't reverse
+upgrade_entries([], Esw, Accr) ->
+    {Accr, Esw};
+upgrade_entries([#entry{agent = A, version = Vsn} = E|Esr], Esw, Accr) ->
+    case lists:keyfind(A, #entry.agent, Esw) of
+        #entry{version = Vsn2} when Vsn2 >= Vsn ->
+            upgrade_entries(Esr, Esw, Accr);
+        #entry{} ->
+            upgrade_entries(
+              Esr, lists:keyreplace(A, #entry.agent, Esw, E), Accr);
+        false ->
+            upgrade_entries(Esr, Esw, [E|Accr])
+    end.
 
 split_related(Related, ID) ->
     case length(ID) of

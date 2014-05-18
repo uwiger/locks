@@ -593,7 +593,7 @@ locks_info(#locks_info{lock = #lock{object = Lock, queue = Q},
                              add_cand(C, IsSynced, Acc)
                      end, S1, NewCands),
     case Q of
-        [#w{entry = #entry{client = FirstC}}|_]
+        [#w{entries = [#entry{client = FirstC}]}|_]
           when is_pid(L), L =/= FirstC ->
             %% We have leader contention! Can happen in the process of
             %% netsplit recovery. Set leader = undefined to put us in
@@ -606,13 +606,13 @@ locks_info(_, S) ->
     S.
 
 new_cands(Node, Q, #st{candidates = Cands}) ->
-    Clients = [C || #w{entry = #entry{client = C}} <- Q,
+    Clients = [C || #w{entries = [#entry{client = C}]} <- Q,
                     C =/= self(), node(C) == Node],
     Clients -- Cands.
 
 synced_lock(Node, Q, #st{held_locks = Held, synced_locks = Synced} = S) ->
     case Q of
-        [#w{entry = #entry{client = C}}|_] when C == self() ->
+        [#w{entries = [#entry{client = C}]}|_] when C == self() ->
             case {lists:member(Node, Synced), lists:member(Node, Held)} of
                 {true, _}      -> {true, S};
                 {false, true}  -> {false, S};
