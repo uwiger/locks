@@ -30,6 +30,7 @@ run_test_() ->
       [
        ?_test(simple_lock())
        , ?_test(one_lock_two_clients())
+       , ?_test(lock_merge())
        , ?_test(lock_upgrade1())
        , ?_test(lock_upgrade2())
        , ?_test(two_clients_direct_deadlock())
@@ -77,6 +78,18 @@ one_lock_two_clients() ->
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
+lock_merge() ->
+    L1 = [?MODULE, ?LINE],
+    L2 = L1 ++ [1],
+    L3 = L1 ++ [2],
+    script([1],
+           [
+            {1, ?LINE, locks, lock, ['$agent', L2, read], match({ok, []})},
+            {1, ?LINE, locks, lock, ['$agent', L3, write], match({ok, []})},
+            {1, ?LINE, locks, lock, ['$agent', L1, write], match({ok, []})},
+            {1, ?LINE, ?MODULE, kill_client, [], match(ok)}
+           ]).
+
 lock_upgrade1() ->
     L1 = [?MODULE, ?LINE],
     L2 = L1 ++ [1],
@@ -99,13 +112,10 @@ lock_upgrade2() ->
     L2 = L1 ++ [1],
     script([1,2],
            [% {1, ?LINE, trace, true},
-            {2, ?LINE, trace, true},
             {1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
             {2, ?LINE, locks, lock, ['$agent', L2, read], match({ok,[]})},
             {1, ?LINE, locks, lock, ['$agent', L1, write], 100,
              match(timeout, timeout)},
-            {1, ?LINE, trace, false},
-            {2, ?LINE, trace, false},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {1, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).

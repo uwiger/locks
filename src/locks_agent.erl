@@ -27,6 +27,7 @@
 -compile({parse_transform, locks_watcher}).
 
 -export([start_link/0, start_link/1, start/1]).
+-export([spawn_agent/1]).
 -export([begin_transaction/1,
 	 begin_transaction/2,
          %%	 acquire_all_or_none/2,
@@ -71,6 +72,7 @@
 
 -record(state, {
           locks = []       :: [#lock{}],
+          interesting = [] :: [lock_id()],
           claimed = []     :: [lock_id()],
           requests = []    :: [#req{}],
           down = []        :: [node()],
@@ -144,21 +146,99 @@ start_link(Options) when is_list(Options) ->
 %% a `#locks_info{}' record or `{have_all_locks, Deadlocks}'.
 %% @end
 start(Options0) when is_list(Options0) ->
+    spawn_agent(true, Options0).
+
+spawn_agent(Options) ->
+    spawn_agent(false, Options).
+
+spawn_agent(Wait, Options0) ->
+    Client = self(),
+    Options = prepare_spawn(Options0),
+    F = fun() -> agent_init(Wait, Client, Options) end,
+    Pid = case lists:keyfind(link, 1, Options) of
+              {_, true} -> spawn_link(F);
+              _         -> spawn(F)
+          end,
+    await_pid(Wait, Pid).
+
+prepare_spawn(Options) ->
     case whereis(locks_server) of
         undefined -> error({not_running, locks_server});
         _ -> ok
     end,
-    Options =
-	case lists:keymember(client, 1, Options0) of
-	    true -> Options0;
-	    false -> [{client, self()}|Options0]
-	end,
-    case proplists:get_value(link, Options, true) of
-        true ->
-            gen_server:start_link(?MODULE, Options, []);
-        false ->
-            gen_server:start(?MODULE, Options, [])
+    case lists:keymember(client, 1, Options) of
+        true -> Options;
+        false -> [{client, self()}|Options]
     end.
+
+agent_init(Wait, Client, Options) ->
+    case init(Options) of
+        {ok, St} ->
+            ack(Wait, Client, {ok, self()}),
+            try loop(St)
+            catch
+                error:Error ->
+                    error_logger:error_report(
+                      [{?MODULE, aborted},
+                       {reason, Error}]),
+                    error(Error)
+            end;
+        Other ->
+            ack(Wait, Client, {error, Other}),
+            error(Other)
+    end.
+
+await_pid(false, Pid) ->
+    {ok, Pid};
+await_pid(true, Pid) ->
+    MRef = erlang:monitor(process, Pid),
+    receive
+        {Pid, Reply} ->
+            erlang:demonitor(MRef),
+            Reply;
+        {'DOWN', MRef, _, _, Reason} ->
+            error(Reason)
+    end.
+
+ack(false, _, _) ->
+    ok;
+ack(true, Pid, Reply) ->
+    Pid ! {self(), Reply}.
+
+loop(St) ->
+    receive Msg ->
+            St1 = handle_msg(Msg, St),
+            loop(St1)
+    end.
+
+handle_msg({'$gen_call', From, Req}, St) ->
+    case handle_call(Req, From, St) of
+        {reply, Reply, St1} ->
+            gen_server:reply(From, Reply),
+            St1;
+        {noreply, St1} ->
+            St1;
+        {stop, Reason, Reply, _} ->
+            gen_server:reply(From, Reply),
+            exit(Reason);
+        {stop, Reason, _} ->
+            exit(Reason)
+    end;
+handle_msg({'$gen_cast', Msg}, St) ->
+    case handle_cast(Msg, St) of
+        {noreply, St1} ->
+            St1;
+        {stop, Reason, _} ->
+            exit(Reason)
+    end;
+handle_msg(Msg, St) ->
+    case handle_info(Msg, St) of
+        {noreply, St1} -> St1;
+        {stop, Reason, _} ->
+            exit(Reason)
+    end.
+
+
 
 -spec begin_transaction(objs()) -> {agent(), lock_result()}.
 %% @equiv begin_transaction(Objects, [])
@@ -223,19 +303,14 @@ lock(Agent, [_|_] = Obj, Mode, [_|_] = Where, R)
                 orelse R == majority_alive) ->
     lock_(Agent, Obj, Mode, Where, R, wait).
 
-lock_(Agent, Obj, Mode, Where, R, Wait) ->
-    case lists:all(fun is_atom/1, Where) of
-        true ->
-            Ref = case Wait of
-                      wait -> erlang:monitor(process, Agent);
-                      nowait -> nowait
-                  end,
-            lock_return(
-              Wait,
-              cast(Agent, {lock, Obj, Mode, Where, R, Wait, self(), Ref}, Ref));
-        false ->
-            error({invalid_nodes, Where})
-    end.
+lock_(Agent, Obj, Mode, [_|_] = Where, R, Wait) ->
+    Ref = case Wait of
+              wait -> erlang:monitor(process, Agent);
+              nowait -> nowait
+          end,
+    lock_return(
+      Wait,
+      cast(Agent, {lock, Obj, Mode, Where, R, Wait, self(), Ref}, Ref)).
 
 change_flag(Agent, Option, Bool)
   when is_boolean(Bool), Option == abort_on_deadlock;
@@ -322,7 +397,7 @@ init(Opts) ->
     {ok,#state{
            locks = [],
            down = [],
-           monitored = ensure_monitor_(?LOCKER, node(), orddict:new()),
+           monitored = orddict:new(),
            await_nodes = AwaitNodes,
            pending = [],
            sync = [],
@@ -350,45 +425,18 @@ handle_call(R, _, State) ->
     {reply, {unknown_request, R}, State}.
 
 %% @private
-handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Request,
-            #state{requests = Reqs} = State) ->
+handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Req,
+            State) ->
     %%
-    ?dbg("~p: Req = ~p~n", [self(), _Request]),
-    case lists:keyfind(Object, #req.object, Reqs) of
-        false ->
-            ?dbg("~p: no previous request for ~p~n", [self(), Object]),
-            S1 = new_request(Object, Mode, Nodes, Require, State),
-            maybe_reply(Wait, Client, Tag, S1);
-        #req{nodes = Nodes1, require = Require, mode = Mode} = Req ->
-            ?dbg("~p: repeated request for ~p~n", [self(), Object]),
-            %% Repeated request
-            case Nodes -- Nodes1 of
-                [] ->
-                    %% no new nodes
-                    maybe_reply(Wait, Client, Tag, State);
-                [_|_] = New ->
-                    S1 = add_nodes(New, Req, State),
-                    maybe_reply(Wait, Client, Tag, S1)
-            end;
-        #req{nodes = Nodes, require = Require, mode = write} when Mode==read ->
-            ?dbg("~p: found old request for write lock on ~p~n", [self(),
-                                                                  Object]),
-            %% The old request is sufficient
-            maybe_reply(Wait, Client, Tag, State);
-        #req{nodes = Nodes, require = Require, mode = read} when Mode==write ->
-            ?dbg("~p: need to upgrade existing read lock on ~p~n",
-                 [self(), Object]),
-            NewLocks = [L || #lock{object = OID} = L <- State#state.locks,
-                             element(1, OID) =/= Object],
-            ?dbg("~p: Remove old lock info on ~p~n", [self(), Object]),
-            S1 = new_request(Object, Mode, Nodes, Require,
-                             State#state{locks = NewLocks}),
-            maybe_reply(Wait, Client, Tag, S1);
-        #req{nodes = PrevNodes} ->
-            %% Different conditions from last time
-            Reason = {conflicting_request,
-                      [Object, Nodes, PrevNodes]},
-            {stop, Reason, {error, Reason}, State}
+    ?dbg("~p: Req = ~p~n", [self(), _Req]),
+    case matching_request(Object, Mode, Nodes, Require, State) of
+        {false, S1} ->
+            ?dbg("~p: no previous matching request for ~p~n", [self(), Object]),
+            maybe_reply(
+              Wait, Client, Tag,
+              new_request(Object, Mode, Nodes, Require, S1));
+        {true, S1} ->
+            maybe_reply(Wait, Client, Tag, S1)
     end;
 handle_cast({option, O, Val}, #state{options = Opts} = S) ->
     S1 = case O of
@@ -408,6 +456,59 @@ handle_cast({option, O, Val}, #state{options = Opts} = S) ->
     {noreply, S1};
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+matching_request(Object, Mode, Nodes, Require,
+                 #state{requests = Requests} = S) ->
+    case [R || #req{object = OID} = R <- Requests, OID == Object] of
+        [] ->
+            {false, S};
+        Reqs ->
+            any_matching_request_(Reqs, Object, Mode, Nodes, Require, S)
+    end.
+
+any_matching_request_([R|Rs], Object, Mode, Nodes, Require, S) ->
+    case matching_request_(R, Object, Mode, Nodes, Require, S) of
+        {false, S1} ->
+            any_matching_request_(Rs, Object, Mode, Nodes, Require, S1);
+        True -> True
+    end;
+any_matching_request_([], _, _, _, _, S) ->
+    {false, S}.
+
+matching_request_(Req, Object, Mode, Nodes, Require, S) ->
+    case Req of
+        #req{nodes = Nodes1, require = Require, mode = Mode} ->
+            ?dbg("~p: repeated request for ~p~n", [self(), Object]),
+            %% Repeated request
+            case Nodes -- Nodes1 of
+                [] ->
+                    {true, S};
+                [_|_] = New ->
+                    {true, add_nodes(New, Req, S)}
+            end;
+        #req{nodes = Nodes, require = Require, mode = write}
+          when Mode==read ->
+            ?dbg("~p: found old request for write lock on ~p~n", [self(),
+                                                                  Object]),
+            %% The old request is sufficient
+            {true, S};
+        #req{nodes = Nodes, require = Require, mode = read} when Mode==write ->
+            ?dbg("~p: need to upgrade existing read lock on ~p~n",
+                 [self(), Object]),
+            ?dbg("~p: Remove old lock info on ~p~n", [self(), Object]),
+            {false, remove_locks(Object, S)};
+        #req{nodes = PrevNodes} ->
+            %% Different conditions from last time
+            Reason = {conflicting_request,
+                      [Object, Nodes, PrevNodes]},
+            error(Reason)
+    end.
+
+remove_locks(Object, #state{locks = Locks} = S) ->
+    NewLocks = [L || #lock{object = OID} = L <- Locks,
+                     element(1, OID) =/= Object],
+    S#state{locks = NewLocks}.
+
 
 new_request(Object, Mode, Nodes, Require, #state{requests = Reqs} = State) ->
     Req = #req{object = Object,
@@ -606,6 +707,8 @@ note_deadlock(A, LockID, #state{deadlocks = Deadlocks} = State) ->
 intersection(A, B) ->
     A -- (A -- B).
 
+ensure_monitor(Node, S) when Node == node() ->
+    S;
 ensure_monitor(Node, #state{monitored = Mon} = S) ->
     Mon1 = ensure_monitor_(?LOCKER, Node, Mon),
     S#state{monitored = Mon1}.
@@ -762,25 +865,23 @@ code_change(_FromVsn, State, _Extra) ->
                               no_locks | waiting | {have_all, deadlocks()}
                                   | {cannot_serve, list()}.
 %%
-all_locks_status(#state{pending = Pending} = State) ->
-    case Pending of
+all_locks_status(#state{pending = []}) ->
+    no_locks;
+all_locks_status(#state{locks = []}) ->
+    waiting;
+all_locks_status(State) ->
+    case waitingfor(State) of
         [] ->
-	    no_locks;
-        [_|_] ->
-	    case waitingfor(State) of
-		[] ->
-                    {have_all, State#state.deadlocks};
-		WF ->
-                    case [O || {O, _} <- WF,
-                               request_can_be_served(O, State) =:= false] of
-                        [] ->
-                            waiting;
-                        Os ->
-                            {cannot_serve, Os}
-                    end
-	    end
+            {have_all, State#state.deadlocks};
+        WF ->
+            case [O || {O, _} <- WF,
+                       request_can_be_served(O, State) =:= false] of
+                [] ->
+                    waiting;
+                Os ->
+                    {cannot_serve, Os}
+            end
     end.
-
 
 
 %% a lock is outdated if the version number is too old,
@@ -804,8 +905,9 @@ waiting_for_ack(#state{sync = Sync}, LockID) ->
 -spec waitingfor(#state{}) -> [lock_id()].
 waitingfor(#state{locks = Locks, requests = Reqs,
                   down = Down}) ->
-    HaveLocks = [{L#lock.object, l_mode(Q)} || #lock{queue = Q} = L <- Locks,
-                                               in(self(), hd(Q))],
+    %% HaveLocks = [{L#lock.object, l_mode(Q)} || #lock{queue = Q} = L <- Locks,
+    %%                                            in(self(), hd(Q))],
+    HaveLocks = have_locks(Locks),
     PendingOIDs =
         lists:foldl(
           fun(#req{object = OID, mode = M,
@@ -850,6 +952,22 @@ waitingfor(#state{locks = Locks, requests = Reqs,
           end, ordsets:new(), Reqs),
     ?dbg("~p: HaveLocks = ~p~n", [self(), HaveLocks]),
     PendingOIDs.
+
+have_locks([#lock{object = Obj,
+                  queue = [#w{entries = [#entry{agent = A}]}|_]}|T])
+           when A == self() ->
+    [{Obj, write} | have_locks(T)];
+have_locks([#lock{object = Obj, queue = [#r{entries = Es}|_]}|T]) ->
+    case lists:keymember(self(), #entry.agent, Es) of
+        true  -> [{Obj, read} | have_locks(T)];
+        false -> have_locks(T)
+    end;
+have_locks([_|T]) ->
+    have_locks(T);
+have_locks([]) ->
+    [].
+
+
 
 l_mode([#r{}|_]) -> read;
 l_mode([#w{}|_]) -> write.
