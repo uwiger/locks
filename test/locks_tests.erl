@@ -54,6 +54,8 @@ run_test_() ->
                     ?_test(d_simple_lock_all(Ns))
                     , ?_test(d_simple_lock_majority(Ns))
                     , ?_test(d_simple_lock_any(Ns))
+                    %% , ?_test(d_lock_surrender(Ns))
+                    %% , ?_test(d_lock_node_dies(Ns))
                    ]}
           end}
       ]}
@@ -219,6 +221,40 @@ d_simple_lock_any(Ns) ->
         match({ok, []})},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
+%% d_lock_surrender(Ns) ->
+%%     L = [?MODULE, ?LINE],
+%%     script(
+%%       [1, 2],
+%%       [{1, ?LINE, locks, lock, ['$agent', L, write, Ns, all],
+%%         match({ok, []})},
+%%        {2, ?LINE, locks, lock, ['$agent', L, write, Ns, all], 300,
+%%         match(timeout, timeout)},
+%%        {1, ?LINE, trace, true},
+%%        {2, ?LINE, trace, true},
+%%        {1, ?LINE, locks_agent, surrender_nowait,
+%%         ['$agent',L,{'$agent',2}, Ns], match(ok)},
+%%        {2, ?LINE, ?MODULE, client_result, [], {ok, []}},
+%%        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
+%%        {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+
+%% d_lock_node_dies(Ns) ->
+%%     A = [?MODULE, ?LINE],
+%%     B = [?MODULE, ?LINE],
+%%     N1 = hd(Ns),
+%%     script(
+%%       [1],
+%%       [{1, ?LINE, locks, lock, ['$agent', A, write, Ns, all],
+%%         match({ok, []})},
+%%        %% {1, ?LINE, trace, true},
+%%        {1, ?LINE, locks, change_flag, ['$agent', await_nodes, true],
+%%         match(ok)},
+%%        {call, ?LINE, rpc, call, [N1, application, stop, [locks]], match(ok)},
+%%        {1, ?LINE, locks, lock, ['$agent', B, write, Ns, all], 100,
+%%         match(error, '_')},
+%%        {call, ?LINE, rpc, call, [N1, application, start, [locks]], match(ok)},
+%%        {1, ?LINE, locks, await_all_locks, ['$agent'], match({ok,[]})}]).
+
 script(Agents, S) ->
     AgentPids = [spawn_agent(A) || A <- Agents],
     try eval_script(S, AgentPids)
@@ -314,10 +350,12 @@ eval_script([E|S], Agents, Acc) ->
         try  ask_agent(E, Agents)
         catch
             error:Reason ->
+                Stack = erlang:get_stacktrace(),
                 io:fwrite(user, ("ERROR: ~p~n"
-                                 "Script: ~p~n"),
+                                 "Script: ~p~n"
+                                 "Trace: ~p~n"),
                           [Reason,
-                           lists:reverse([{E, {'EXIT', Reason}}|Acc])]),
+                           lists:reverse([{E, {'EXIT', Reason}}|Acc]), Stack]),
                 error(Reason)
         end,
     eval_script(S, Agents1, [{E, Res}|Acc]);
@@ -333,6 +371,15 @@ eval_script([], Agents, Acc) ->
             error({remaining, Remain})
     end.
 
+ask_agent({call, _L, M, F, A, Match} = _E, Agents) ->
+    io:fwrite(user, "ask_agent(~p)~n", [_E]),
+    {C, Res} = try {normal, apply(M, F, A)}
+               catch
+                   error:E -> {error, E}
+               end,
+    io:fwrite(user, "~p -> ~p:~p~n", [_E, C, Res]),
+    _ = Match(C, Res, undefined),
+    {ok, Agents};
 ask_agent({A, _L, trace, Bool}, Agents) ->
     {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
     if Bool ->
@@ -356,7 +403,7 @@ ask_agent({A, L, M, F, Args, Match}, Agents) ->
 ask_agent({A, _, M, F, Args, Timeout, Match} = _E, Agents) ->
     io:fwrite(user, "ask_agent(~p)~n", [_E]),
     {_, Pid, APid, St} = lists:keyfind(A, 1, Agents),
-    {C, Res} = ask_client(Pid, M, F, Args, Timeout),
+    {C, Res} = ask_client(Pid, M, F, subst(Args, Agents), Timeout),
     io:fwrite(user, "~p -> ~p:~p~n", [_E, C, Res]),
     St1 = Match(C, Res, St),
     {Res, lists:keyreplace(A, 1, Agents, {A, Pid, APid, St1})}.
@@ -364,6 +411,14 @@ ask_agent({A, _, M, F, Args, Timeout, Match} = _E, Agents) ->
 repl_agent(Pid, Args) ->
     lists:map(fun('$agent') -> Pid;
                  (X) -> X
+              end, Args).
+
+subst(Args, Agents) ->
+    lists:map(fun({'$agent',N}) ->
+                      {_, _, APid, _} = lists:keyfind(N, 1, Agents),
+                      APid;
+                 (Other) ->
+                      Other
               end, Args).
 
 match(Const) ->

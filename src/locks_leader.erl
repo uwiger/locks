@@ -1,4 +1,16 @@
 %% -*- mode: erlang; indent-tabs-mode: nil; -*-
+%%---- BEGIN COPYRIGHT -------------------------------------------------------
+%%
+%% Copyright (C) 2013 Ulf Wiger. All rights reserved.
+%%
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at http://mozilla.org/MPL/2.0/.
+%%
+%%---- END COPYRIGHT ---------------------------------------------------------
+%% Key contributor: Thomas Arts <thomas.arts@quviq.com>
+%%
+%%=============================================================================
 %% @doc Leader election behavior
 %%
 %% This behavior is inspired by gen_leader, and offers the same API
@@ -58,7 +70,8 @@
 	 cast/2,
 	 leader_call/2,
          leader_reply/2,
-	 leader_cast/2]).
+	 leader_cast/2,
+         info/1, info/2]).
 
 -export([init/1,
 	 handle_info/2,
@@ -346,6 +359,18 @@ leader_cast(L, Msg) ->
     ?event({leader_cast, L, Msg}),
     gen_server:cast(L, {'$locks_leader_cast', Msg}).
 
+info(L) ->
+    ?event({info, L}),
+    R = gen_server:call(L, '$locks_leader_info'),
+    ?event({info_return, L, R}),
+    R.
+
+info(L, Item) ->
+    ?event({info, L, Item}),
+    R = gen_server:call(L, {'$locks_leader_info', Item}),
+    ?event({info_return, L, Item, R}),
+    R.
+
 -spec call(L::server_ref(), Request::any()) -> any().
 %% @doc Make a `gen_server'-like call to the leader candidate `L'.
 %% @end
@@ -375,6 +400,10 @@ init({Reg, Module, St, Options, P}) ->
     register(Reg, self()),
     init_(Module, St, Options, P, Reg);
 init({Module, St, Options, P}) ->
+    case lists:keyfind(registered_name, 1, Options) of
+        {_, Reg} -> register(Reg, self());
+        false    -> ok
+    end,
     init_(Module, St, Options, P, undefined).
 
 init_(Module, ModSt0, Options, Parent, Reg) ->
@@ -389,7 +418,7 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		    abort_init(Reason, Parent)
 	    catch
 		error:Error ->
-		    abort_init(Error, Parent)
+		    abort_init({Error, erlang:get_stacktrace()}, Parent)
 	    end,
     AllNodes = [node()|nodes()],
     Agent =
@@ -469,6 +498,10 @@ safe_loop(#st{agent = A} = S) ->
 	{?MODULE, am_worker, W} = _Msg ->
 	    ?event(_Msg, S),
 	    noreply(worker_announced(W, S));
+        {'$gen_call', From, '$info'} ->
+            handle_call('$locks_leader_info', From, S);
+        {'$gen_call', From, {'$locks_leader_info', Item}} ->
+            handle_call({'$locks_leader_info', Item}, From, S);
         {'$gen_call', {_, {?MODULE, _Ref}} = From, Req} ->
             %% locks_leader-tagged call; handle also in safe loop
             ?event({safe_call, Req}),
@@ -543,6 +576,29 @@ handle_call(Req, {_, {?MODULE, _Ref}} = From,
     noreply(
       callback_reply(M:handle_call(Req, From, MSt, opaque(S)), From,
                     fun unchanged/1, S));
+handle_call('$locks_leader_info', From, S) ->
+    I = [{leader, leader(S)},
+         {leader_node, leader_node(S)},
+         {candidates, candidates(S)},
+         {new_candidates, new_candidates(S)},
+         {workers, workers(S)},
+         {module, S#st.mod},
+         {mod_state, S#st.mod_state}],
+    gen_server:reply(From, I),
+    noreply(S);
+handle_call({'$locks_leader_info', Item}, From, S) ->
+    I = case Item of
+            leader -> leader(S);
+            leader_node -> leader_node(S);
+            candidates  -> candidates(S);
+            new_candidates -> new_candidates(S);
+            workers        -> workers(S);
+            module         -> S#st.mod;
+            mod_state      -> S#st.mod_state;
+            _ -> undefined
+        end,
+    gen_server:reply(From, I),
+    noreply(S);
 handle_call({'$locks_leader_call', Req} = Msg, From,
 	    #st{mod = M, mod_state = MSt, leader = L,
 		buffered = Buf} = S) ->
@@ -662,7 +718,7 @@ monitor_cand(Client) ->
 
 maybe_announce_leader(Pid, IsSynced,
                       #st{leader = L, mod = M, mod_state = MSt} = S) ->
-    if L == self(), IsSynced ->
+    if L == self(), IsSynced == false ->
 	    case M:elected(MSt, opaque(S), Pid) of
 		{reply, Msg, MSt1} ->
 		    Pid ! msg(am_leader, Msg),
@@ -670,7 +726,16 @@ maybe_announce_leader(Pid, IsSynced,
 		{ok, MSt1} ->
 		    S#st{mod_state = MSt1};
 		{ok, Msg, MSt1} ->
-		    do_broadcast(S#st{mod_state = MSt1}, Msg)
+		    do_broadcast(S#st{mod_state = MSt1}, Msg);
+                {surrender, Other, MSt1} ->
+                    case lists:member(Other, S#st.candidates) of
+                        true ->
+                            locks_agent:surrender_nowait(
+                              S#st.agent, S#st.lock, Other, S#st.nodes),
+                            S#st{leader = undefined};
+                        false ->
+                            error({cannot_surrender, Other})
+                    end
 	    end;
        true ->
 	    S
