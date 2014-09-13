@@ -17,7 +17,7 @@
 %%
 -module(gdict).
 
--export([new/0, new/1,
+-export([new/0, new/1, new_opt/1,
 	 %% new/3,
 	 append/3,
 	 append_list/3,
@@ -58,6 +58,9 @@ new() ->
 
 new(Name) ->
     locks_leader:start_link(Name, test_cb, dict:new(), []).
+
+new_opt(Opts) ->
+    locks_leader:start_link(test_cb, dict:new(), Opts).
 
 -define(store(Dict,Expr,Legend),
 	locks_leader:leader_call(Dict, {store, fun(D) ->

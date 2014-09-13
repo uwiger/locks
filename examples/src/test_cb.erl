@@ -54,6 +54,8 @@
 -record(st, {am_leader = false,
 	     dict}).
 
+-define(event(E), event(?LINE, E)).
+
 %% @spec init(Arg::term()) -> {ok, State}
 %%
 %%   State = state()
@@ -61,7 +63,7 @@
 %% @doc Equivalent to the init/1 function in a gen_server.
 %%
 init(Dict) ->
-    io:fwrite("init(~p)~n", [Dict]),
+    ?event({init, Dict}),
     {ok, #st{dict = Dict}}.
 
 %% @spec elected(State::state(), I::info(), Cand::pid() | undefined) ->
@@ -117,18 +119,17 @@ init(Dict) ->
 %% @end
 %%
 elected(#st{dict = Dict} = S, I, undefined) ->
-    io:fwrite("elected leader, merging~n", []),
+    ?event(elected_leader),
     case locks_leader:new_candidates(I) of
 	[] ->
-	    io:fwrite("elected(~p)~n", [dict:to_list(Dict)]),
+	    ?event({elected, Dict}),
 	    {ok, {sync, Dict}, S#st{am_leader = true}};
 	Cands ->
-	    io:fwrite("New candidates = ~p~n", [Cands]),
+	    ?event({new_candidates, Cands}),
 	    NewDict = merge_dicts(Dict, I),
 	    {ok, {sync, NewDict}, S#st{am_leader = true, dict = NewDict}}
     end;
 elected(#st{dict = Dict} = S, _E, Pid) when is_pid(Pid) ->
-    io:fwrite("new cand: syncing with ~p (~p)~n", [Pid, dict:to_list(Dict)]),
     {reply, {sync, Dict}, S#st{am_leader = true}}.
 
 %% This is sub-optimal, but it's only an example!
@@ -136,10 +137,10 @@ merge_dicts(D, I) ->
     {Good, _Bad} = locks_leader:ask_candidates(merge, I),
     lists:foldl(
       fun({C, {true, D2}}, Acc) ->
-	      io:fwrite("merge: got ~p from ~w~n", [dict:to_list(D2),C]),
+	      ?event({merge_got, C, D2}),
 	      dict:merge(fun(_K,V1,_) -> V1 end, Acc, D2);
 	 ({C, false}, Acc) ->
-	      io:fwrite("merge: got ~p from ~w~n", [false, C]),
+	      ?event({merge_got, C, false}),
 	      Acc
       end, D, Good).
 
@@ -162,9 +163,8 @@ merge_dicts(D, I) ->
 %%      {ok, LeaderDict}.
 %% </pre>
 %% @end
-surrendered(#st{dict = OurDict} = S, {sync, LeaderDict}, _I) ->
-    io:fwrite("surrendered(Old:~p, New:~p)~n", [dict:to_list(OurDict),
-						dict:to_list(LeaderDict)]),
+surrendered(#st{dict = _OurDict} = S, {sync, LeaderDict}, _I) ->
+    ?event({surrendered, LeaderDict}),
     {ok, S#st{dict = LeaderDict, am_leader = false}}.
 
 %% @spec handle_DOWN(Candidate::pid(), State::state(), I::info()) ->
@@ -178,8 +178,7 @@ surrendered(#st{dict = OurDict} = S, {sync, LeaderDict}, _I) ->
 %% If the function returns a `Broadcast' object, this will be sent to all
 %% candidates, and they will receive it in the function {@link from_leader/3}.
 %% @end
-handle_DOWN(Pid, S, _I) ->
-    io:fwrite("handle_DOWN(~p,Dict,E)~n", [Pid]),
+handle_DOWN(_Pid, S, _I) ->
     {ok, S}.
 
 %% @spec handle_leader_call(Msg::term(), From::callerRef(), State::state(),
@@ -219,11 +218,11 @@ handle_DOWN(Pid, S, _I) ->
 %% which can lead to race conditions.
 %% @end
 handle_leader_call({store,F} = Op, _From, #st{dict = Dict} = S, _I) ->
-    io:fwrite("handle_leader_call(~p, _From, Dict, I)~n", [Op]),
+    ?event({handle_leader_call, Op}),
     NewDict = F(Dict),
     {reply, ok, {store, F}, S#st{dict = NewDict}};
 handle_leader_call({leader_lookup,F} = Op, _From, #st{dict = Dict} = S, _I) ->
-    io:fwrite("handle_leader_call(~p, From, Dict, I)~n", [Op]),
+    ?event({handle_leader_call, Op}),
     Reply = F(Dict),
     {reply, Reply, S#st{dict = Dict}}.
 
@@ -235,7 +234,7 @@ handle_leader_call({leader_lookup,F} = Op, _From, #st{dict = Dict} = S, _I) ->
 %% leader_cast()}.
 %% @end
 handle_leader_cast(_Msg, S, _I) ->
-    io:fwrite("handle_leader_cast(~p, Dict, I)~n", [_Msg]),
+    ?event({handle_leader_cast, _Msg}),
     {ok, S}.
 
 %% @spec from_leader(Msg::term(), State::state(), I::info()) ->
@@ -251,10 +250,9 @@ handle_leader_cast(_Msg, S, _I) ->
 from_leader({sync, D}, #st{} = S, _I) ->
     {ok, S#st{dict = D}};
 from_leader({store,F} = Op, #st{dict = Dict} = S, _I) ->
-    io:fwrite("from_leader(~p, Dict, I)~n", [Op]),
+    ?event({from_leader, Op}),
     NewDict = F(Dict),
     {ok, S#st{dict = NewDict}}.
-
 
 %% @spec handle_call(Request::term(), From::callerRef(), State::state(),
 %%                   I::info()) ->
@@ -326,4 +324,8 @@ code_change(_FromVsn, S, _I, _Extra) ->
 %% module.
 %% @end
 terminate(_Reason, _S) ->
+    ok.
+
+
+event(_Line, _Event) ->
     ok.

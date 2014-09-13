@@ -28,6 +28,8 @@
     begin_transaction/1,  %% (Objects) -> (Objects, [])
     begin_transaction/2,  %% (Objects, Options)
     end_transaction/1,    %% (Agent)
+    spawn_agent/0,        %% () -> spawn_agent([])
+    spawn_agent/1,        %% (Options)
     lock/2,               %% (Agent,OID) -> (Agent,OID,write,[node()],all)
     lock/3,               %% (Agent,OID,Mode) -> (Agent,OID,Mode,[node()],all)
     lock/4,               %% (Agent,OID,Mode,Nodes) -> (..., all)
@@ -36,7 +38,11 @@
     lock_nowait/3,
     lock_nowait/4,
     lock_objects/2,       %% (Agent, Objects)
-    await_all_locks/1]).  %% (Agent)
+    await_all_locks/1,    %% (Agent)
+    watch/2,              %% (OID, Nodes)
+    unwatch/2,            %% (OID, Nodes)
+    watchers/1,           %% (OID)
+    change_flag/3]).      %% (Agent, Flag, Value)
 
 -include("locks.hrl").
 
@@ -69,6 +75,14 @@ begin_transaction(Objects) ->
 %% @end
 begin_transaction(Objects, Options) when is_list(Objects), is_list(Options) ->
     locks_agent:begin_transaction(Objects, Options).
+
+-spec spawn_agent() -> {ok, agent()}.
+spawn_agent() ->
+    spawn_agent([]).
+
+-spec spawn_agent(options()) -> {ok, agent()}.
+spawn_agent(Options) ->
+    locks_agent:spawn_agent(Options).
 
 -spec end_transaction(pid()) -> ok.
 %% @doc Terminates the transaction agent, releasing all locks.
@@ -176,3 +190,34 @@ lock_objects(Agent, Objects) ->
 %% @end
 await_all_locks(Agent) ->
     locks_agent:await_all_locks(Agent).
+
+-spec watch(oid(), [node()]) -> ok.
+%% @doc Subscribe to lock state changes.
+%%
+%% This function ensures that `#lock_info{}' messages are sent for each
+%% lock state change in `OID' on `Nodes'. The subscription is not
+%% persistent; if a node dies, the knowledge of processes watching locks
+%% on that node will disappear.
+%% @end
+watch(OID, Nodes) ->
+    locks_server:watch(OID, Nodes).
+
+change_flag(Agent, Option, Bool)
+  when is_boolean(Bool), Option == abort_on_deadlock;
+       is_boolean(Bool), Option == await_nodes;
+       is_boolean(Bool), Option == notify ->
+    locks_agent:change_flag(Agent, Option, Bool).
+
+-spec unwatch(oid(), [node()]) -> ok.
+%% @doc Remove a subscription created by {@link watch/2}.
+%%
+%% This function removes a subscription created by {@link watch/2}.
+%% @end
+unwatch(OID, Nodes) ->
+    locks_server:unwatch(OID, Nodes).
+
+-spec watchers(oid()) -> [pid()].
+%% @doc List the process IDs of watchers of `OID' on the current node.
+%% @end
+watchers(OID) ->
+    locks_server:watchers(OID).

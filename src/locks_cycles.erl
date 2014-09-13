@@ -20,11 +20,8 @@
 
 -module(locks_cycles).
 
--ifdef(TEST).
--define(dbg(Fmt, Args), io:fwrite(Fmt, Args)).
--else.
--define(dbg(Fmt, Args), ok).
--endif.
+
+-define(event(E), event(?LINE, E)).
 
 -export([components/2, ex/1]).
 
@@ -37,7 +34,7 @@ components(Nodes,Arrow) ->
     map(fun(Node) ->
            {Node, [ N || N <- Nodes, Arrow(Node, N)]}
         end,Nodes),
-    ?dbg("Graph = ~p~n", [Graph]),
+    ?event({graph, Graph}),
   [ Comp || Comp<-sc(Nodes, Graph, [], []), oncycle(Comp, Arrow)].
 
 oncycle([A], Arrow) ->
@@ -113,3 +110,6 @@ ex(3) ->
   [{1,2},{1,1},{2,2},{1,3},{3,3}];
 ex(4) ->
   [{1,2,obj1},{1,3,obj2},{3,1,obj3}].
+
+event(_Line, _Event) ->
+    ok.
