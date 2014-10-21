@@ -69,6 +69,7 @@
 	 call/2, call/3,
 	 cast/2,
 	 leader_call/2,
+	 leader_call/3,
          leader_reply/2,
 	 leader_cast/2,
          info/1, info/2]).
@@ -332,6 +333,28 @@ start_link(Reg, Module, St, Options) when is_atom(Reg), is_atom(Module) ->
 %% @end
 leader_call(L, Request) ->
     case catch gen_server:call(L, {'$locks_leader_call', Request}) of
+	{'$locks_leader_reply',Res} = _R ->
+	    ?event({leader_call_return, L, Request, _R}),
+	    Res;
+	'$leader_died' = _R ->
+	    ?event({leader_call_return, L, Request, _R}),
+	    error({leader_died, {?MODULE, leader_call, [L, Request]}});
+	{'EXIT',Reason} = _R ->
+	    ?event({leader_call_return, L, Request, _R}),
+	    error({Reason, {?MODULE, leader_call, [L, Request]}})
+    end.
+
+-spec leader_call(Name::server_ref(), Request::term(), integer()|infinity) -> term().
+%% @doc Make a timeout-guarded synchronous call to the leader.
+%%
+%% This function is similar to `gen_server:call/3', but is forwarded to
+%% the leader by the leader candidate `L' (unless, of course, it is the
+%% leader, in which case it handles it directly). If the leader should die
+%% before responding, this function will raise an `error({leader_died,...})'
+%% exception.
+%% @end
+leader_call(L, Request, Timeout) ->
+    case catch gen_server:call(L, {'$locks_leader_call', Request}, Timeout) of
 	{'$locks_leader_reply',Res} = _R ->
 	    ?event({leader_call_return, L, Request, _R}),
 	    Res;
