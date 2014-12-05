@@ -1,13 +1,20 @@
-.PHONY: all clean compile test doc
+.PHONY: all clean compile test doc deps
 
 all: compile
 
-compile:
+deps:
+	rebar get-deps
+
+compile: deps
 	rebar compile
 
 clean:
 	rebar clean
 	rm doc/*.md doc/*.png doc/stylesheet.css
+
+examples: compile
+	cd examples
+	rebar compile
 
 test:
 	rebar clean compile eunit
