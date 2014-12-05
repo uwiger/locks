@@ -651,7 +651,7 @@ handle_info({locks_running,N}, #state{down = Down, pending = Pending} = S) ->
 handle_info({'EXIT', Client, Reason}, #state{client = Client} = S) ->
     {stop, Reason, S};
 handle_info(_Msg, State) ->
-    io:fwrite("Unknown msg: ~p~n", [_Msg]),
+    ?dbg("Unknown msg: ~p~n", [_Msg]),
     {noreply,State}.
 
 maybe_reply(nowait, _, _, State) ->
@@ -838,7 +838,7 @@ handle_locks(#state{have_all = true} = State) ->
     %% If we have all locks we've asked for, no need to search for potential
     %% deadlocks - reasonably, we cannot be involved in one.
     State;
-handle_locks(#state{agents = As, deadlocks = Deadlocks} = State) ->
+handle_locks(#state{agents = As} = State) ->
     InvolvedAgents = involved_agents(As),
     case analyse(InvolvedAgents, State) of
 	ok ->
@@ -1095,7 +1095,7 @@ store_lock_holders(Prev, #lock{object = Obj} = Lock,
 
 delete_lock(#lock{object = OID, queue = Q} = L,
             #state{locks = Ls, agents = As, interesting = I} = S) ->
-    io:fwrite("delete_lock(~p, ~p)~n", [L, S]),
+    ?dbg("delete_lock(~p, ~p)~n", [L, S]),
     LockHolders = lock_holders(L),
     ets_delete(Ls, OID),
     [ets_delete(As, {A,OID}) || A <- LockHolders],
