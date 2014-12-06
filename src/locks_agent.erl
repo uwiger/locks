@@ -546,10 +546,11 @@ matching_request_(Req, Tab, Object, Mode, Nodes, Require, S) ->
             error(Reason)
     end.
 
-remove_locks(Object, #state{locks = Locks, agents = As} = S) ->
+remove_locks(Object, #state{locks = Locks, agents = As,
+                            interesting = I} = S) ->
     ets:match_delete(Locks, #lock{object = {Object,'_'}, _ = '_'}),
     ets:match_delete(As, {{self(),{Object,'_'}}}),
-    S.
+    S#state{interesting = prune_interesting(I, object, Object)}.
 
 new_request(Object, Mode, Nodes, Require, #state{pending = Pending,
                                                  claim_no = Cl} = State) ->
@@ -697,12 +698,13 @@ request_can_be_served(#req{nodes = Ns, require = R}, #state{down = Down}) ->
 handle_nodedown(Node, #state{down = Down, requests = Reqs,
                              pending = Pending,
                              monitored = Mon, locks = Locks,
+                             interesting = I,
                              agents = Agents} = S) ->
     ?dbg("~p: handle_nodedown (~p)~n", [self(), Node]),
     ets_match_delete(Locks, #lock{object = {'_',Node}, _ = '_'}),
     ets_match_delete(Agents, {{'_',{'_',Node}}}),
     Down1 = [Node|Down -- [Node]],
-    S1 = S#state{down = Down1},
+    S1 = S#state{down = Down1, interesting = prune_interesting(I, node, Node)},
     case {requests_with_node(Node, Reqs),
           requests_with_node(Node, Pending)} of
         {[], []} ->
@@ -727,6 +729,10 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
             end
     end.
 
+prune_interesting(I, node, Node) ->
+    [OID || {_, N} = OID <- I, N =/= Node];
+prune_interesting(I, object, Object) ->
+    [OID || {O, _} = OID <- I, O =/= Object].
 
 watch_node(N) ->
     {M, F, A} =

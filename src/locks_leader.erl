@@ -92,7 +92,7 @@
          broadcast_to_candidates/2,
          ask_candidates/2]).
 
--export_type([leader_info/0, mod_state/0, msg/0]).
+-export_type([leader_info/0, mod_state/0, msg/0, election/0]).
 
 -type option() :: {role, candidate | worker}
                 | {resource, any()}.
@@ -506,8 +506,11 @@ safe_loop(#st{agent = A} = S) ->
 	{locks_agent, A, Info} = _Msg ->
 	    ?event(_Msg, S),
 	    case Info of
-		{have_all_locks,_} -> noreply(become_leader(S));
-		#locks_info{}      -> noreply(locks_info(Info, S))
+		{have_all_locks,_} ->
+                    noreply(become_leader(S));
+                #locks_info{} ->
+                    noreply(locks_info(
+                              Info, maybe_become_leader(Info, S)))
 	    end;
 	#locks_info{} = I ->   % if worker - direct from locks_server
 	    ?event(I, S),
@@ -755,7 +758,7 @@ maybe_announce_leader(Pid, IsSynced,
                         true ->
                             locks_agent:surrender_nowait(
                               S#st.agent, S#st.lock, Other, S#st.nodes),
-                            S#st{leader = undefined};
+                            S#st{mod_state = MSt1, leader = undefined};
                         false ->
                             error({cannot_surrender, Other})
                     end
@@ -775,6 +778,22 @@ maybe_remove_cand(candidate, Pid, #st{candidates = Cs, synced = Synced,
     end;
 maybe_remove_cand(worker, Pid, #st{workers = Ws} = S) ->
     S#st{workers = Ws -- [Pid]}.
+
+%% Called from safe_loop to cover case where agent doesn't send a(nother)
+%% 'have_all_lacks' message, but we have set leader to 'undefined' to deal
+%% with a netsplit situation.
+maybe_become_leader(#locks_info{lock = #lock{object = Lock,
+                                             queue = Q}},
+                    #st{lock = Lock, leader = undefined} = S) ->
+    Me = self(),
+    case Q of
+        [#w{entries = [#entry{client = Me}]}|_] ->
+            become_leader(S);
+        _ ->
+            S
+    end;
+maybe_become_leader(_, S) ->
+    S.
 
 
 become_leader(#st{leader = L, mod = M, mod_state = MSt,
