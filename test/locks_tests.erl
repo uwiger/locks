@@ -39,13 +39,15 @@ run_test_() ->
        , ?_test(two_clients_abort_on_deadlock())
        , {setup,
           fun() ->
+                  stop_slaves([locks_1, locks_2]),
                   start_slaves([locks_1, locks_2]),
                   Nodes = nodes(),
                   io:fwrite(user, "Nodes = ~p~n", [Nodes]),
                   rpc:multicall(Nodes, application, start, [locks]),
                   Nodes
           end,
-          fun(_Ns) ->
+          fun(Ns) ->
+                  stop_slaves(Ns),
                   ok
           end,
           fun(Ns) ->
@@ -446,6 +448,24 @@ start_slaves(Ns) ->
     [H|T] = Nodes = [start_slave(N) || N <- Ns],
     _ = [rpc:call(H, net_adm, ping, [N]) || N <- T],
     Nodes.
+
+stop_slaves(Ns) ->
+    [ok = stop_slave(N) || N <- Ns],
+    ok.
+
+stop_slave(N) ->
+    try erlang:monitor_node(N, true) of
+	true ->
+	    rpc:call(N, erlang, halt, []),
+	    receive
+		{nodedown, N} -> ok
+	    after 10000 ->
+		    erlang:error(timeout)
+	    end
+    catch
+	error:badarg ->
+	    ok
+    end.
 
 start_slave(Name) ->
     case node() of

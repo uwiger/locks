@@ -50,6 +50,7 @@
 	 await_all_locks/1,
          change_flag/3,
 	 lock_info/1,
+         transaction_status/1,
          %%	 await_all_or_none/1,
 	 end_transaction/1]).
 
@@ -63,9 +64,14 @@
 	 code_change/3
 	]).
 
+-export([record_fields/1]).
+
 -import(lists,[foreach/2,any/2,map/2,member/2]).
 
 -include("locks.hrl").
+
+-define(event(E), event(?LINE, E, none)).
+-define(event(E, S), event(?LINE, E, S)).
 
 -ifdef(DEBUG).
 -define(dbg(Fmt, Args), io:fwrite(user, Fmt, Args)).
@@ -77,6 +83,11 @@
                      | {abort_on_deadlock, boolean()}
                      | {await_nodes, boolean()}
                      | {notify, boolean()}.
+
+-type transaction_status() :: no_locks
+                            | {have_all_locks, list()}
+                            | waiting
+                            | {cannot_serve, list()}.
 
 -record(req, {object,
               mode,
@@ -102,10 +113,22 @@
                                | {pid(), events}],
           answer           :: locking | waiting | done,
           deadlocks = []   :: deadlocks(),
-          have_all = false :: boolean()
+          have_all = false :: boolean(),
+          status = no_locks :: transaction_status()
          }).
 
 -define(myclient,State#state.client).
+
+-define(rf(R), record_fields(R) -> record_info(fields, R)).
+?rf(state);
+?rf(req);
+?rf(lock);
+?rf(locks_info);
+?rf(w);
+?rf(r);
+?rf(entry);
+record_fields(_) ->
+    no.
 
 %%% interface function
 
@@ -226,10 +249,10 @@ ack(false, _, _) ->
 ack(true, Pid, Reply) ->
     Pid ! {self(), Reply}.
 
-loop(St) ->
+loop(#state{status = OldStatus} = St) ->
     receive Msg ->
             St1 = handle_msg(Msg, St),
-            loop(St1)
+            loop(maybe_status_change(OldStatus, St1))
     end.
 
 handle_msg({'$gen_call', From, Req}, St) ->
@@ -396,6 +419,24 @@ lock_objects(Agent, Objects) ->
 lock_info(Agent) ->
     call(Agent, lock_info).
 
+-spec transaction_status(agent()) -> transaction_status().
+%% @doc Inquire about the current status of the transaction.
+%% Return values:
+%% <dl>
+%% <dt>`no_locks'</dt>
+%%   <dd>No locks have been requested</dd>
+%% <dt>`{have_all_locks, Deadlocks}'</dt>
+%%   <dd>All requested locks have been claimed, `Deadlocks' indicates whether
+%%       any deadlocks were resolved in the process.</dd>
+%% <dt>`waiting'</dt>
+%%   <dd>Still waiting for some locks.</dd>
+%% <dt>`{cannot_serve, Objs}'</dt>
+%%   <dd>Some lock requests cannot be served, e.g. because some nodes are
+%%       unavailable.</dd>
+%% </dl>
+%% @end
+transaction_status(Agent) ->
+    call(Agent, transaction_status).
 
 call(A, Req) ->
     call(A, Req, 5000).
@@ -403,10 +444,10 @@ call(A, Req) ->
 call(A, Req, Timeout) ->
     case gen_server:call(A, Req, Timeout) of
         {abort, Reason} ->
-            ?dbg("~p: call(~p, ~p) -> ABORT:~p~n", [self(), A, Req, Reason]),
+            ?event({abort, Reason, [A, Req, Timeout]}),
             error(Reason);
         Res ->
-            ?dbg("~p: call(~p, ~p) -> ~p~n", [self(), A, Req, Res]),
+            ?event({result, Res, [A, Req, Timeout]}),
             Res
     end.
 
@@ -441,8 +482,10 @@ init(Opts) ->
 handle_call(lock_info, _From, #state{locks = Locks,
                                      pending = Pending} = State) ->
     {reply, {ets:tab2list(Pending), ets:tab2list(Locks)}, State};
+handle_call(transaction_status, _From, #state{status = Status} = State) ->
+    {reply, Status, State};
 handle_call(await_all_locks, {Client, Tag}, State) ->
-    await_all_locks_(Client, Tag, State);
+    {noreply, check_if_done(add_waiter(wait, Client, Tag, State))};
 handle_call(stop, {Client, _}, State) when Client==?myclient ->
     {stop, normal, ok, State};
 handle_call(R, _, State) ->
@@ -452,17 +495,18 @@ handle_call(R, _, State) ->
 handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Req,
             State) ->
     %%
-    ?dbg("~p: Req = ~p~n", [self(), _Req]),
-    case matching_request(Object, Mode, Nodes, Require, State) of
+    ?event(_Req, State),
+    case matching_request(Object, Mode, Nodes, Require,
+                          add_waiter(Wait, Client, Tag, State)) of
         {false, S1} ->
-            ?dbg("~p: no previous matching request for ~p~n", [self(), Object]),
-            maybe_reply(
-              Wait, Client, Tag,
-              new_request(Object, Mode, Nodes, Require, S1));
+            ?event({no_matching_request, Object}),
+            {noreply, check_if_done(
+                        new_request(Object, Mode, Nodes, Require, S1))};
         {true, S1} ->
-            maybe_reply(Wait, Client, Tag, S1)
+            {noreply, check_if_done(S1)}
     end;
-handle_cast({surrender, O, ToAgent, Nodes}, S) ->
+handle_cast({surrender, O, ToAgent, Nodes} = _Req, S) ->
+    ?event(_Req, S),
     case lists:all(
            fun(N) ->
                    #lock{queue = Q} = L = get_lock({O,N}, S),
@@ -474,19 +518,28 @@ handle_cast({surrender, O, ToAgent, Nodes}, S) ->
                      fun(OID, Sx) ->
                              do_surrender(self(), OID, [ToAgent], Sx)
                      end, S, [{O, N} || N <- Nodes]),
-            {noreply, NewS};
+            {noreply, check_if_done(NewS)};
         false ->
             {stop, {cannot_surrender, [O, ToAgent]}, S}
     end;
-handle_cast({option, O, Val}, #state{options = Opts} = S) ->
+handle_cast({option, O, Val}, #state{notify = Notify,
+                                     client = C, options = Opts} = S) ->
     S1 = case O of
              await_nodes ->
                  S#state{await_nodes = Val};
              notify ->
-                 Entry = {S#state.client, events},
+                 Entry = {C, events},
                  case Val of
                      true ->
-                         S#state{notify = [Entry|S#state.notify -- [Entry]]};
+                         S1a = case Notify of
+                                   [] ->
+                                       Status = all_locks_status(S),
+                                       set_status(Status, S);
+                                   _ -> S
+                              end,
+                         %% always send an initial status notification
+                         C ! {?MODULE, self(), S1a#state.status},
+                         S1a#state{notify = list_store(Entry, Notify)};
                      false ->
                          S#state{notify = S#state.notify -- [Entry]}
                  end;
@@ -496,6 +549,13 @@ handle_cast({option, O, Val}, #state{options = Opts} = S) ->
     {noreply, S1};
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+list_store(E, L) ->
+    case lists:member(E, L) of
+        true -> L;
+        false ->
+            [E|L]
+    end.
 
 matching_request(Object, Mode, Nodes, Require,
                  #state{requests = Requests,
@@ -520,7 +580,7 @@ any_matching_request_([], _, _, _, _, _, S) ->
 matching_request_(Req, Tab, Object, Mode, Nodes, Require, S) ->
     case Req of
         #req{nodes = Nodes1, require = Require, mode = Mode} ->
-            ?dbg("~p: repeated request for ~p~n", [self(), Object]),
+            ?event({repeated_request, Object}),
             %% Repeated request
             case Nodes -- Nodes1 of
                 [] ->
@@ -530,14 +590,11 @@ matching_request_(Req, Tab, Object, Mode, Nodes, Require, S) ->
             end;
         #req{nodes = Nodes, require = Require, mode = write}
           when Mode==read ->
-            ?dbg("~p: found old request for write lock on ~p~n", [self(),
-                                                                  Object]),
+            ?event({found_old_write_request, Object}),
             %% The old request is sufficient
             {true, S};
         #req{nodes = Nodes, require = Require, mode = read} when Mode==write ->
-            ?dbg("~p: need to upgrade existing read lock on ~p~n",
-                 [self(), Object]),
-            ?dbg("~p: Remove old lock info on ~p~n", [self(), Object]),
+            ?event({need_upgrade, Object}),
             {false, remove_locks(Object, S)};
         #req{nodes = PrevNodes} ->
             %% Different conditions from last time
@@ -588,33 +645,28 @@ union(A, B) ->
 
 %% @private
 handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, S0) ->
-    ?dbg("~p: handle_info(~p~n", [self(), I]),
+    ?event({handle_info, I}, S0),
     LockID = {Lock0#lock.object, Node},
     Lock = Lock0#lock{object = LockID},
     Prev = ets_lookup(S0#state.locks, LockID),
     State = check_note(Note, LockID, S0),
     case outdated(Prev, Lock) orelse waiting_for_ack(State, LockID) of
 	true ->
-            ?dbg("~p: outdated or waiting for ack~n"
-                 "LockID = ~p; Sync = ~p~n"
-                 "Locks = ~p~n",
-                 [self(), LockID, State#state.sync, State#state.locks]),
+            ?event({outdated_or_waiting_for_ack, [LockID]}),
 	    {noreply,State};
 	false ->
 	    NewState = i_add_lock(State, Lock, Prev),
-	    case State#state.notify of
-		[] ->
-		    {noreply, handle_locks(NewState)};
-		_ ->
-		    {noreply, handle_locks(check_if_done(NewState, [I]))}
-	    end
+            {noreply, handle_locks(check_if_done(NewState, [I]))}
     end;
-handle_info({surrendered, A, OID}, State) ->
+handle_info({surrendered, A, OID} = _Msg, State) ->
+    ?event(_Msg),
     {noreply, note_deadlock(A, OID, State)};
-handle_info({'DOWN', Ref, _, _, _}, #state{client_mref = Ref} = State) ->
+handle_info({'DOWN', Ref, _, _, _Rsn}, #state{client_mref = Ref} = State) ->
+    ?event({client_DOWN, _Rsn}),
     {stop, normal, State};
 handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
             #state{down = Down} = S) ->
+    ?event({locker_DOWN, Node}),
     case lists:member(Node, Down) of
         true -> {noreply, S};
         false ->
@@ -623,7 +675,8 @@ handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
 handle_info({'DOWN',_,_,_,_}, S) ->
     %% most likely a watcher
     {noreply, S};
-handle_info({nodeup, N}, #state{down = Down} = S) ->
+handle_info({nodeup, N} = _Msg, #state{down = Down} = S) ->
+    ?event(_Msg),
     case lists:member(N, Down) of
         true  -> watch_node(N);
         false -> ignore
@@ -632,7 +685,8 @@ handle_info({nodeup, N}, #state{down = Down} = S) ->
 handle_info({nodedown,_}, S) ->
     %% We react on 'DOWN' messages above instead
     {noreply, S};
-handle_info({locks_running,N}, #state{down = Down, pending = Pending} = S) ->
+handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending} = S) ->
+    ?event(Msg),
     case lists:member(N, Down) of
         true ->
             S1 = S#state{down = Down -- [N]},
@@ -651,32 +705,56 @@ handle_info({locks_running,N}, #state{down = Down, pending = Pending} = S) ->
     end;
 handle_info({'EXIT', Client, Reason}, #state{client = Client} = S) ->
     {stop, Reason, S};
-handle_info(_Msg, State) ->
-    ?dbg("Unknown msg: ~p~n", [_Msg]),
-    {noreply,State}.
+handle_info(_Msg, S) ->
+    ?event({unknown_msg, _Msg}),
+    {noreply, S}.
 
-maybe_reply(nowait, _, _, State) ->
-    {noreply, State};
-maybe_reply(wait, Client, Tag, State) ->
-    await_all_locks_(Client, Tag, State).
 
-await_all_locks_(Client, Tag, State) ->
-    case all_locks_status(State) of
-        no_locks ->
-            gen_server:reply({Client, Tag}, {error, no_locks}),
-	    {noreply, State};
-        {have_all, Deadlocks} ->
-            Msg = {have_all_locks, Deadlocks},
-            gen_server:reply({Client, Tag}, Msg),
-            {noreply, notify(Msg, State#state{have_all = true})};
-        waiting ->
-            Entry = {Client, Tag, await_all_locks},
-            {noreply, State#state{notify = [Entry|State#state.notify]}};
-        {cannot_serve, Objs} ->
-            Reason = {could_not_lock_objects, Objs},
-            gen_server:reply({Client, Tag}, Reason),
-            {stop, {error, Reason}, State}
-    end.
+add_waiter(nowait, _, _, State) ->
+    State;
+add_waiter(wait, Client, Tag, #state{notify = Notify} = State) ->
+    State#state{notify = [{Client, Tag, await_all_locks}|Notify]}.
+
+%% maybe_reply(nowait, _, _, State) ->
+%%     {noreply, State};
+%% maybe_reply(wait, Client, Tag, State) ->
+%%     await_all_locks_(Client, Tag, State).
+
+%% await_all_locks_(Client, Tag, State) ->
+%%     Status = all_locks_status(State),
+%%     ?event({all_locks_status, Status}),
+%%     State1 = set_status(Status, State),
+%%     case Status of
+%%         no_locks ->
+%%             gen_server:reply({Client, Tag}, {error, no_locks}),
+%% 	    {noreply, State1};
+%%         {have_all_locks, Deadlocks} ->
+%%             Msg = {have_all_locks, Deadlocks},
+%%             gen_server:reply({Client, Tag}, Msg),
+%%             {noreply, notify(Msg, State1)};
+%%         waiting ->
+%%             Entry = {Client, Tag, await_all_locks},
+%%             {noreply, State1#state{notify = [Entry|State#state.notify]}};
+%%         {cannot_serve, Objs} ->
+%%             Reason = {could_not_lock_objects, Objs},
+%%             gen_server:reply({Client, Tag}, Reason),
+%%             {stop, {error, Reason}, State1}
+%%     end.
+
+set_status(Status, #state{status = Status} = S) ->
+    S;
+set_status({have_all_locks, _} = Status, S) ->
+    have_all(S#state{status = Status});
+set_status(Status, S) ->
+    S#state{status = Status, have_all = false}.
+
+
+maybe_status_change(Status, #state{status = Status} = State) ->
+    ?event(no_status_change),
+    State;
+maybe_status_change(OldStatus, #state{status = Status} = S) ->
+    ?event({status_change, OldStatus, Status}),
+    notify(Status, S).
 
 requests_for_obj_can_be_served(Obj, #state{pending = Pending} = S) ->
     lists:all(
@@ -700,7 +778,7 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                              monitored = Mon, locks = Locks,
                              interesting = I,
                              agents = Agents} = S) ->
-    ?dbg("~p: handle_nodedown (~p)~n", [self(), Node]),
+    ?event({handle_nodedown, Node}, S),
     ets_match_delete(Locks, #lock{object = {'_',Node}, _ = '_'}),
     ets_match_delete(Agents, {{'_',{'_',Node}}}),
     Down1 = [Node|Down -- [Node]],
@@ -743,7 +821,7 @@ watch_node(N) ->
 check_note([], _, State) ->
     State;
 check_note({surrender, A}, LockID, State) when A == self() ->
-    ?dbg("~p: surrender_ack (~p)~n", [self(), LockID]),
+    ?event({surrender_ack, LockID}),
     Sync = [L || #lock{object = Ox} = L <- State#state.sync,
                  Ox =/= LockID],
     State#state{sync = Sync};
@@ -784,33 +862,17 @@ request_lock({OID, Node}, Mode, #state{client = Client} = State) ->
     State.
 
 request_surrender({OID, Node} = _LockID, #state{}) ->
-    ?dbg("request_surrender(~p~n", [_LockID]),
+    ?event({request_surrender, _LockID}),
     locks_server:surrender(OID, Node).
 
 check_if_done(S) ->
     check_if_done(S, []).
 
-check_if_done(#state{pending = Pending} = State, Msgs) ->
-    case ets:info(Pending, size) of
-        0 ->
-            notify_msgs(Msgs, have_all(State));
-        _ ->
-            check_if_done_(State, Msgs)
-    end.
-
-check_if_done_(State, Msgs) ->
-    case waitingfor(State) of
-        [_|_] = _WF ->   % not done
-            ?dbg("~p: waitingfor() -> ~p - not done~n", [self(), _WF]),
-            %% We don't clear the 'claimed' list here, since it tells us if
-            %% we have told our client we have a certain lock
-            notify_msgs(Msgs, State#state{have_all = false});
-        [] ->
-            %% _DLs = State#state.deadlocks,
-            Msg = {have_all_locks, State#state.deadlocks},
-            ?dbg("~p: have all locks~n", [self()]),
-            notify_msgs([Msg|Msgs], have_all(State))
-    end.
+check_if_done(#state{notify = []} = S, _) ->
+    S;
+check_if_done(#state{} = State, Msgs) ->
+    Status = all_locks_status(State),
+    notify_msgs(Msgs, set_status(Status, State)).
 
 have_all(#state{claim_no = Cl} = State) ->
     State#state{have_all = true, claim_no = Cl + 1}.
@@ -852,14 +914,13 @@ handle_locks(#state{agents = As} = State) ->
 	    %% inefficient computation, optimizes easily
 	    Tell = send_indirects(State),
             if Tell =/= [] ->
-                    ?dbg("~p: Tell = ~p~n", [self(), Tell]);
+                    ?event({tell, Tell});
                true ->
                     ok
             end,
 	    State;
-	{deadlock,ShouldSurrender,ToObject} ->
-	    ?dbg("~p: deadlock: ShouldSurrender = ~p, ToObject = ~p~n",
-		 [self(), ShouldSurrender, ToObject]),
+	{deadlock,ShouldSurrender,ToObject} = _DL ->
+            ?event(_DL),
             case ShouldSurrender == self()
                 andalso
                 (proplists:get_value(
@@ -879,16 +940,17 @@ do_surrender(ShouldSurrender, ToObject, InvolvedAgents,
     OldLock = get_lock(ToObject, State),
     State1 = delete_lock(OldLock, State),
     NewDeadlocks = [{ShouldSurrender, ToObject} | Deadlocks],
+    ?event({do_surrender, [{should_surrender, ShouldSurrender},
+                           {to_object, ToObject},
+                           {involved_agents, InvolvedAgents}]}),
     if ShouldSurrender == self() ->
             request_surrender(ToObject, State1),
             send_surrender_info(InvolvedAgents, OldLock),
             Sync1 = [OldLock | State1#state.sync],
-            ?dbg("~p: Sync1 = ~p~n"
-                 "Old Locks = ~p~n"
-                 "Old Sync = ~p~n", [self(), Sync1, Locks,
-                                     State1#state.sync]),
-            State1#state{sync = Sync1,
-                         deadlocks = NewDeadlocks};
+            set_status(
+              waiting,
+              State1#state{sync = Sync1,
+                           deadlocks = NewDeadlocks});
        true ->
             State1#state{deadlocks = NewDeadlocks}
     end.
@@ -935,21 +997,45 @@ code_change(_FromVsn, State, _Extra) ->
 %%%%%%%%%%%%%%%%%%% data manipulation %%%%%%%%%%%%%%%%%%%
 
 -spec all_locks_status(#state{}) ->
-                              no_locks | waiting | {have_all, deadlocks()}
+                              no_locks
+                                  | waiting
+                                  | {have_all_locks, deadlocks()}
                                   | {cannot_serve, list()}.
 %%
-all_locks_status(#state{locks = Locks, pending = Pend} = State) ->
+all_locks_status(#state{pending = Pend, locks = Locks} = State) ->
+    Status = all_locks_status_(State),
+    ?event({locks_diagnostics,
+            [{pending, pp_pend(ets:tab2list(Pend))},
+             {locks, pp_locks(ets:tab2list(Locks))}]}),
+    ?event({all_locks_status, Status}),
+    Status.
+
+pp_pend(Pend) ->
+    [{O, M, Ns, Req} || #req{object = O, mode = M, nodes = Ns,
+                             require = Req} <- Pend].
+
+pp_locks(Locks) ->
+    [{O,lock_holder(Q)} ||
+        #lock{object = O, pid = Pid, queue = Q} <- Locks].
+
+lock_holder([#w{entries = [#entry{agent = A}]}|_]) ->
+    A;
+lock_holder([#r{entries = Es}|_]) ->
+    [A || #entry{agent = A} <- Es].
+
+
+all_locks_status_(#state{locks = Locks, pending = Pend} = State) ->
     case ets:info(Locks, size) of
         0 ->
             case ets:info(Pend, size) of
-                0 -> {have_all, State#state.deadlocks};
+                0 -> no_locks;
                 _ ->
                     waiting
             end;
         _ ->
             case waitingfor(State) of
                 [] ->
-                    {have_all, State#state.deadlocks};
+                    {have_all_locks, State#state.deadlocks};
                 WF ->
                     case [O || {O, _} <- WF,
                                requests_for_obj_can_be_served(
@@ -1007,8 +1093,8 @@ waitingfor(#state{requests = Reqs,
                    require = any, nodes = Ns} = R, {SAcc, PAcc}) ->
                   case [N || N <- nodes_locked(OID, M, S),
                              member(N, Ns)] of
-                      [] -> {[R|SAcc], PAcc};
-                      [_|_] ->
+                      [_|_] -> {[R|SAcc], PAcc};
+                      [] ->
                           {SAcc, ordsets:add_element(OID, PAcc)}
                   end;
              (#req{object = OID, mode = M,
@@ -1022,7 +1108,7 @@ waitingfor(#state{requests = Reqs,
              (_, Acc) ->
                   Acc
           end, {[], ordsets:new()}, Pending),
-    ?dbg("~p: HaveLocks = ~p~n", [self(), HaveLocks]),
+    ?event([{served, Served}, {pending_oids, PendingOIDs}]),
     move_requests(Served, Pending, Reqs),
     PendingOIDs.
 
@@ -1101,7 +1187,7 @@ store_lock_holders(Prev, #lock{object = Obj} = Lock,
 
 delete_lock(#lock{object = OID, queue = Q} = L,
             #state{locks = Ls, agents = As, interesting = I} = S) ->
-    ?dbg("delete_lock(~p, ~p)~n", [L, S]),
+    ?event({delete_lock, L}),
     LockHolders = lock_holders(L),
     ets_delete(Ls, OID),
     [ets_delete(As, {A,OID}) || A <- LockHolders],
@@ -1227,7 +1313,7 @@ analyse(_Agents, #state{interesting = I, locks = Ls}) ->
 			      andalso in_tail(A2, tl(Queue))
 		  end, Locks)
 	end,
-    ?dbg("~p: Connect = ~p~n", [self(), Connect]),
+    ?event({connect, Connect}),
     case locks_cycles:components(Nodes, Connect) of
 	[] ->
 	    ok;
@@ -1264,3 +1350,6 @@ max_agent([{A1, O1}, {A2, _O2} | Rest]) when A1 > A2 ->
     max_agent([{A1, O1} | Rest]);
 max_agent([{_A1, _O1}, {A2, O2} | Rest]) ->
     max_agent([{A2, O2} | Rest]).
+
+event(_Line, _Event, _State) ->
+    ok.

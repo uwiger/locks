@@ -31,11 +31,10 @@
 	 terminate/2,
 	 code_change/3]).
 
--ifdef(DEBUG).
--define(dbg(Fmt, Args), io:fwrite(Fmt, Args)).
--else.
--define(dbg(F,A), ok).
--endif.
+-export([record_fields/1]).
+
+-define(event(E), event(?LINE, E, none)).
+-define(event(E, S), event(?LINE, E, S)).
 
 -include("locks.hrl").
 
@@ -47,6 +46,12 @@
 		     ets:new(?AGENTS, [public, named_table, bag])},
 	     monitors = dict:new(),
 	     notify_as = self()}).
+
+record_fields(st) ->
+    record_info(fields, st);
+record_fields(_) ->
+    no.
+
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -126,46 +131,47 @@ handle_call(_Req, _From, S) ->
     {reply, {error, unknown_request}, S}.
 
 handle_cast({lock, LockID, Agent, Client, Mode} = _Msg, #st{tabs = Tabs} = S) ->
-    ?dbg("handle_cast(~p)~n", [_Msg]),
+    ?event({handle_cast, _Msg}),
     Updated = insert(LockID, Agent, Client, Mode, Tabs),
-    ?dbg("insert: Updated = ~p~n", [Updated]),
+    ?event({updated, Updated}),
     notify(Updated, S#st.notify_as),
     {noreply, monitor_agent(Agent, S)};
 handle_cast({surrender, LockID, Agent} = _Msg, #st{tabs = Tabs} = S) ->
-    ?dbg("handle_cast(~p)~n", [_Msg]),
+    ?event({handle_cast, _Msg}),
     Updated = do_surrender(LockID, Agent, Tabs),
     notify(Updated, S#st.notify_as, {surrender, Agent}),
     {noreply, S};
 handle_cast({remove_agent, Agent} = _Msg, #st{tabs = Tabs} = S) ->
-    ?dbg("handle_cast(~p)~n", [_Msg]),
+    ?event({handle_cast, _Msg}),
     Updated = do_remove_agent(Agent, Tabs),
-    ?dbg("Agent ~p removed; Updated = ~p~n", [Agent, Updated]),
+    ?event([{agent_removed, Agent}, {updated, Updated}]),
     notify(Updated, S#st.notify_as),
-    ?dbg("notify done~n", []),
+    ?event(notify_done),
     {noreply, demonitor_agent(Agent, S)};
 handle_cast({watch, LockID, Pid} = _Msg, #st{tabs = Tabs} = S) ->
-    ?dbg("handle_cast(~p)~n", [_Msg]),
+    ?event({handle_cast, _Msg}),
     insert_watcher(LockID, Pid, Tabs),
     {noreply, monitor_agent(Pid, S)};
 handle_cast({unwatch, LockID, Pid} = _Msg, #st{tabs = Tabs} = S) ->
-    ?dbg("handle_cast(~p)~n", [_Msg]),
+    ?event({handle_cast, _Msg}),
     delete_watcher(LockID, Pid, Tabs),
     {noreply, S};
-handle_cast(_, S) ->
+handle_cast(_Msg, S) ->
+    ?event({unknown_cast, _Msg}),
     {noreply, S}.
 
 handle_info({lock, _, _, _} = Msg, #st{} = S) ->
-    ?dbg("handle_info(~p)~n", [Msg]),
+    ?event({handle_info, Msg}),
     handle_cast(Msg, S);
 handle_info({remove_agent, _} = Msg, S) ->
-    ?dbg("handle_info(~p)~n", [Msg]),
+    ?event({handle_info, Msg}),
     handle_cast(Msg, S);
 handle_info({'DOWN', _Ref, process, Pid, _} = _Msg, #st{tabs = Tabs} = S) ->
-    ?dbg("handle_info(~p)~n", [_Msg]),
+    ?event({handle_info, _Msg}),
     Updated = do_remove_agent(Pid, Tabs),
-    ?dbg("DOWN (~p); Updated = ~p~n", [Pid, Updated]),
+    ?event({updated, Pid, Updated}),
     notify(Updated, S#st.notify_as),
-    ?dbg("~p: notify done~n", [?LINE]),
+    ?event(notify_done),
     {noreply, demonitor_agent(Pid, S)};
 handle_info(_, S) ->
     {noreply, S}.
@@ -182,7 +188,7 @@ notify(Locks, Me) ->
     notify(Locks, Me, []).
 
 notify([#lock{queue = Q, watchers = W} = H|T], Me, Note) ->
-    ?dbg("notify(#lock{queue=~p, watchers = ~p}~n", [Q, W]),
+    ?event({notify, Q, W}),
     Msg = #locks_info{lock = H, note = Note},
     _ = [send(A, Msg) || #entry{agent = A} <- queue_entries(Q)],
     _ = [send(P, Msg) || P <- W],
@@ -191,15 +197,15 @@ notify([], _, _) ->
     ok.
 
 send(Pid, Msg) when is_pid(Pid) ->
-    ?dbg("~p ! ~p~n", [Pid, Msg]),
+    ?event({send, Pid, Msg}),
     Pid ! Msg;
 send({Agent,_} = _A, Msg) when is_pid(Agent) ->
-    ?dbg("(~p) ~p ! ~p~n", [_A, Agent, Msg]),
+    ?event({send, Agent, Msg}),
     Agent ! Msg.
 
 queue_entries(Q) ->
     Res = queue_entries_(Q),
-    ?dbg("Entries (~p): ~p~n", [Q, Res]),
+    ?event({queue_entries, Q, Res}),
     Res.
 
 queue_entries_([#r{entries = Es}|Q]) ->
@@ -215,7 +221,7 @@ insert(ID, Agent, Client, Mode, {Locks, Tids})
     Related = related_locks(ID, Locks),
     NewVsn = new_vsn(Related),
     {Check, Result} = insert_agent(Related, ID, Agent, Client, Mode, NewVsn),
-    ?dbg("insert_agent(~p, ~p, ...) -> ~p~n", [ID, Agent, {Check, Result}]),
+    ?event({insert_agent, ID, Agent, {Check, Result}}),
     ets:insert(Tids, [{Agent,ID1} || #lock{object = ID1} <- Result]),
     check_tids(Check, ID, Agent, Result, Tids),
     ets:insert(Locks, Result),
@@ -328,7 +334,7 @@ do_remove_agent(A, {Locks, Agents}) ->
     case ets:lookup(Agents, A) of
 	[] -> [];
 	Found ->
-            ?dbg("Removing agent ~p; Found = ~p~n", [A, Found]),
+            ?event([{removing_agent, A}, {found, Found}]),
 	    ets:delete(Agents, A),
 	    do_remove_agent_(Found, Locks, [])
     end.
@@ -571,7 +577,7 @@ update_children(Children, Entry, Mode, Vsn) ->
 
 update_children([#lock{queue = Q} = H | T], Entry, Mode, Vsn, Acc, QAcc) ->
     QAcc1 = merge_queue(Q, QAcc),
-    ?dbg("merge_queue(~p, ~p) -> ~p~n", [Q, QAcc, QAcc1]),
+    ?event({merge_queue, Q, QAcc, QAcc1}),
     Acc1 = [H#lock{version = Vsn,
 		   queue = into_queue(Mode, Q, Entry)} | Acc],
     if T == [] ->
@@ -627,7 +633,7 @@ sort_insert_entries([], Es) ->
 
 upgrade_entries(Esr, Esw) ->
     R = upgrade_entries(Esr, Esw, []),
-    ?dbg("upgrade_entries(~p, ~p) -> ~p~n", [Esr, Esw, R]),
+    ?event({upgrade_entries, Esr, Esw, R}),
     R.
 
 %% The order of the lists don't matter, so we don't reverse
@@ -711,6 +717,9 @@ split4_ps(L, Acc) -> {lists:reverse(Acc), L}.
 split4([#lock{object = [_,_,_,_]} = Mine|Ch], Ps, _) -> {Ps, Mine, Ch};
 split4(Ch, Ps, _ID) -> {Ps, [], Ch}.
 
+event(_Line, _Msg, _St) ->
+    ok.
+
 %% ===================================================================
 
 -ifdef(TEST).
@@ -733,26 +742,26 @@ simple_lock() ->
     L1 = [?MODULE, ?LINE],
     Msgs1 = req(lock, L1, write),
     [#locks_info{lock = #lock{object = L1}}] = Msgs1,
-    ?dbg("~p - msgs: ~p~n", [?LINE, Msgs1]),
+    ?event({msgs, Msgs1}),
     L2 = L1 ++ [x],
     _Msgs2 = req(lock, L2, read),
-    ?dbg("~p - msgs: ~p~n", [?LINE, _Msgs2]),
+    ?event({msgs, _Msgs2}),
     L3 = [?MODULE],
     _Msgs3 = req(lock, L3, read),
-    ?dbg("~p - msgs: ~p~n", [?LINE, _Msgs3]),
+    ?event({msgs, _Msgs3}),
     remove_agent([node()]),
     ok.
 
 simple_upgrade() ->
     L1 = [?MODULE, ?LINE],
     _Msgs1 = req(lock, L1, read),
-    ?dbg("~p - msgs: ~p~n", [?LINE, _Msgs1]),
+    ?event({msgs, _Msgs1}),
     L2 = L1 ++ [x],
     _Msgs2 = req(lock, L2, write),
-    ?dbg("~p - msgs: = ~p~n", [?LINE, _Msgs2]),
+    ?event({msgs, _Msgs2}),
     L3 = [?MODULE],
     _Msgs3 = req(lock, L3, read),
-    ?dbg("~p - msgs: ~p~n", [?LINE, _Msgs3]),
+    ?event({msgs, _Msgs3}),
     ok.
 
 
