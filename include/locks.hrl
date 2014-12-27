@@ -15,7 +15,7 @@
 -type oid()      :: [any()].
 -type mode()     :: read | write.
 -type where()    :: [node()].
--type req()      :: any | all | majority.
+-type req()      :: any | all | majority | all_alive.
 -type agent()    :: pid().
 -type tid()      :: any().
 

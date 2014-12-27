@@ -349,7 +349,7 @@ lock(Agent, [_|_] = Obj, Mode, [_|_] = Where) ->
 lock(Agent, [_|_] = Obj, Mode, [_|_] = Where, R)
   when is_pid(Agent) andalso (Mode == read orelse Mode == write)
        andalso (R == all orelse R == any orelse R == majority
-                orelse R == majority_alive) ->
+                orelse R == majority_alive orelse R == all_alive) ->
     lock_(Agent, Obj, Mode, Where, R, wait).
 
 lock_(Agent, Obj, Mode, [_|_] = Where, R, Wait) ->
@@ -410,7 +410,8 @@ lock_objects(Agent, Objects) ->
                              andalso (Req == all
                                       orelse Req == any
                                       orelse Req == majority
-                                      orelse Req == majority_alive) ->
+                                      orelse Req == majority_alive
+                                      orelse Req == all_alive) ->
                           lock_nowait(Agent, Obj, Mode, Where);
                      (L) ->
                           error({illegal_lock_pattern, L})
@@ -769,8 +770,8 @@ request_can_be_served(#req{nodes = Ns, require = R}, #state{down = Down}) ->
         all       -> intersection(Down, Ns) == [];
         any       -> Ns -- Down =/= [];
         majority  -> length(Ns -- Down) > (length(Ns) div 2);
-        majority_alive ->
-            true
+        majority_alive -> true;
+        all_alive      -> true
     end.
 
 handle_nodedown(Node, #state{down = Down, requests = Reqs,
@@ -1016,7 +1017,7 @@ pp_pend(Pend) ->
 
 pp_locks(Locks) ->
     [{O,lock_holder(Q)} ||
-        #lock{object = O, pid = Pid, queue = Q} <- Locks].
+        #lock{object = O, queue = Q} <- Locks].
 
 lock_holder([#w{entries = [#entry{agent = A}]}|_]) ->
     A;
@@ -1101,6 +1102,15 @@ waitingfor(#state{requests = Reqs,
                    require = all, nodes = Ns} = R, {SAcc, PAcc}) ->
                   NodesLocked = nodes_locked(OID, M, S),
                   case Ns -- NodesLocked of
+                      [] -> {[R|SAcc], PAcc};
+                      [_|_] ->
+                          {SAcc, ordsets:add_element(OID, PAcc)}
+                  end;
+             (#req{object = OID, mode = M,
+                   require = all_alive, nodes = Ns} = R, {SAcc, PAcc}) ->
+                  Alive = Ns -- Down,
+                  NodesLocked = nodes_locked(OID, M, S),
+                  case Alive -- NodesLocked of
                       [] -> {[R|SAcc], PAcc};
                       [_|_] ->
                           {SAcc, ordsets:add_element(OID, PAcc)}

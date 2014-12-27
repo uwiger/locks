@@ -461,7 +461,7 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		{ok, A} = locks_agent:start([{notify,true},
                                              {await_nodes, true}]),
 		locks_agent:lock_nowait(
-		  A, Lock, write, AllNodes, majority_alive),
+		  A, Lock, write, AllNodes, all_alive),
 		A;
 	    worker ->
 		%% watch our own local lock. All candidates will try for it.
@@ -572,7 +572,7 @@ handle_info({locks_agent, A, Info} = _Msg, #st{agent = A} = S) ->
         waiting when S#st.leader == self() ->
             ?event(clearing_leader),
             send_all(S, {?MODULE, leader_uncertain, self(), nodes()}),
-            noreply(S#st{leader = undefined});
+            noreply(S#st{leader = undefined, synced = []});
         _ ->
             noreply(S)
     end;
@@ -612,9 +612,11 @@ handle_cast({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
 						    leader = L} = S) ->
     if L == self() ->
 	    noreply(callback(M:handle_leader_cast(Msg, MSt, opaque(S)), S));
-       true ->
+       is_pid(L) ->
 	    gen_server:cast(L, Cast),
-	    noreply(S)
+	    noreply(S);
+       true ->
+            noreply(S)
     end;
 handle_cast(Msg, #st{mod = M, mod_state = MSt} = St) ->
     noreply(callback(M:handle_cast(Msg, MSt, opaque(St)), St)).
@@ -691,7 +693,7 @@ nodeup(N, #st{nodes = Nodes} = S) ->
 
 include_node(N, #st{agent = A, lock = Lock, nodes = Nodes} = S) ->
     ?event({include_node, N}),
-    locks_agent:lock_nowait(A, Lock, write, [N], majority_alive),
+    locks_agent:lock_nowait(A, Lock, write, [N], all_alive),
     S#st{nodes = [N|Nodes]}.
 
 locks_info(#locks_info{lock = #lock{object = Lock} = L,
