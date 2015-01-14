@@ -76,7 +76,11 @@ init(Dict) ->
 %%     NState    = state()
 %%
 %% @doc Called by the leader when it is elected leader, and each time a
-%% candidate recognizes the leader.
+%% candidate or worker recognizes the leader. In the following we refer to
+%% 'candidates', whether they are candidates or workers. The difference is
+%% that only actual candidates can take over the leadership role. If the
+%% callback logic needs to know the type of `Cand', it can check the
+%% candidates and workers lists respectively.
 %%
 %% This function is only called in the leader instance, and `Broadcast'
 %% will be sent to all candidates (when the leader is first elected),

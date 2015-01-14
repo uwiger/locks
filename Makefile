@@ -8,9 +8,14 @@ deps:
 compile: deps
 	rebar compile
 
+debug: clean deps
+	rebar compile erl_opts="\[\{d,DEBUG\}\]"
+	cd examples
+	rebar compile erl_opts="\[\{d,DEBUG\}\]"
+
 clean:
 	rebar clean
-	rm doc/*.md doc/*.png doc/stylesheet.css
+	rm -f doc/*.md doc/*.png doc/stylesheet.css
 
 examples: compile
 	cd examples

@@ -65,12 +65,12 @@ new_opt(Opts) ->
 -define(store(Dict,Expr,Legend),
 	locks_leader:leader_call(Dict, {store, fun(D) ->
 						     Expr
-					     end})).
+					     end}, 2000)).
 
 -define(lookup(Dict, Expr, Legend),
 	locks_leader:call(Dict, {lookup, fun(D) ->
 					       Expr
-				       end})).
+				       end}, 2000)).
 
 %% dict functions that modify state:
 append(Key, Value, Dict) ->

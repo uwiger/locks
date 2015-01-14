@@ -92,7 +92,9 @@
          broadcast_to_candidates/2,
          ask_candidates/2]).
 
--export_type([leader_info/0, mod_state/0, msg/0]).
+-export([record_fields/1]).
+
+-export_type([leader_info/0, mod_state/0, msg/0, election/0]).
 
 -type option() :: {role, candidate | worker}
                 | {resource, any()}.
@@ -120,8 +122,6 @@
 	  %% mode = dynamic,
 	  initial = true,
 	  lock,
-          held_locks = [],
-          synced_locks = [],
 	  agent,
 	  leader,
 	  nodes = [],
@@ -154,6 +154,16 @@
 -callback handle_call(msg(), from(), mod_state(), leader_info()) -> cb_reply().
 -callback handle_cast(msg(), mod_state(), leader_info()) -> cb_return().
 -callback handle_info(msg(), mod_state(), leader_info()) -> cb_return().
+
+-define(rf(R), record_fields(R) -> record_info(fields, R)).
+?rf(st);
+?rf(lock);
+?rf(entry);
+?rf(w);
+?rf(r);
+?rf(locks_info);
+record_fields(_) ->
+    no.
 
 -spec candidates(election()) -> [pid()].
 %% @doc Return the current list of candidates.
@@ -451,7 +461,7 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		{ok, A} = locks_agent:start([{notify,true},
                                              {await_nodes, true}]),
 		locks_agent:lock_nowait(
-		  A, Lock, write, AllNodes, majority_alive),
+		  A, Lock, write, AllNodes, all_alive),
 		A;
 	    worker ->
 		%% watch our own local lock. All candidates will try for it.
@@ -501,13 +511,18 @@ noreply(Stop) when element(1, Stop) == stop ->
 safe_loop(#st{agent = A} = S) ->
     receive
 	{nodeup, N} ->
-	    ?event({nodeup, N}, S),
+	    ?event({nodeup, N, nodes()}, S),
 	    noreply(nodeup(N, S));
 	{locks_agent, A, Info} = _Msg ->
 	    ?event(_Msg, S),
 	    case Info of
-		{have_all_locks,_} -> noreply(become_leader(S));
-		#locks_info{}      -> noreply(locks_info(Info, S))
+                #locks_info{} ->
+                    noreply(locks_info(Info, S));
+                {have_all_locks, _} ->
+                    noreply(become_leader(S));
+                OtherInfo ->
+                    ?event(OtherInfo, S),
+                    noreply(S)
 	    end;
 	#locks_info{} = I ->   % if worker - direct from locks_server
 	    ?event(I, S),
@@ -541,18 +556,30 @@ event(_Line, _Event, _State) ->
     ok.
 
 %% @private
-handle_info({nodeup, N} = _Msg, #st{role = candidate} = S) ->
-    ?event({handle_info, _Msg}, S),
+handle_info({nodeup, N}, #st{role = candidate} = S) ->
+    ?event({handle_info, {nodeup, N, nodes()}}, S),
     noreply(nodeup(N, S));
+handle_info({nodedown, N}, #st{nodes = Nodes}  =S) ->
+    ?event({nodedown, N}, S),
+    noreply(S#st{nodes = Nodes -- [N]});
 handle_info({'DOWN', _, _, _, _} = Msg, S) ->
     ?event({handle_info, Msg}, S),
     noreply(down(Msg, S));
 handle_info({locks_agent, A, Info} = _Msg, #st{agent = A} = S) ->
     ?event({handle_info, _Msg}, S),
     case Info of
-	{have_all_locks,_} -> noreply(become_leader(S));
-	#locks_info{}      -> noreply(locks_info(Info, S))
+	#locks_info{}      -> noreply(locks_info(Info, S));
+        waiting when S#st.leader == self() ->
+            ?event(clearing_leader),
+            send_all(S, {?MODULE, leader_uncertain, self(), nodes()}),
+            noreply(S#st{leader = undefined, synced = []});
+        _ ->
+            noreply(S)
     end;
+handle_info({?MODULE, leader_uncertain, L, Nodes}, #st{leader = L} = S) ->
+    %% Enter safe_loop, since our leader has done so.
+    ?event({leader_uncertain, L, Nodes}, S),
+    noreply(S#st{leader = undefined});
 handle_info({?MODULE, am_worker, W} = _Msg, #st{} = S) ->
     ?event({handle_info, _Msg}, S),
     noreply(worker_announced(W, S));
@@ -585,9 +612,11 @@ handle_cast({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
 						    leader = L} = S) ->
     if L == self() ->
 	    noreply(callback(M:handle_leader_cast(Msg, MSt, opaque(S)), S));
-       true ->
+       is_pid(L) ->
 	    gen_server:cast(L, Cast),
-	    noreply(S)
+	    noreply(S);
+       true ->
+            noreply(S)
     end;
 handle_cast(Msg, #st{mod = M, mod_state = MSt} = St) ->
     noreply(callback(M:handle_cast(Msg, MSt, opaque(St)), St)).
@@ -654,53 +683,40 @@ code_change(_, St, _) ->
     {ok, St}.
 
 
-nodeup(N, #st{agent = A, candidates = Cands, lock = Lock} = S) ->
-    case [true || P <- Cands, node(P) == N] of
-	[_|_] ->
-	    ok;
-	[] ->
-	    locks_agent:lock_nowait(A, Lock, write, [N], majority_alive)
-    end,
-    S.
+nodeup(N, #st{nodes = Nodes} = S) ->
+    case lists:member(N, Nodes) of
+        true ->
+            S;
+        false ->
+            include_node(N, S)
+    end.
 
-locks_info(#locks_info{lock = #lock{object = Lock, queue = Q},
-                       where = Node} = _I,
-	   #st{lock = Lock, leader = L} = S) ->
-    NewCands = new_cands(Node, Q, S),
-    {IsSynced, S1} = synced_lock(Node, Q, S),
-    S2 = lists:foldl(fun(C, Acc) ->
-                             add_cand(C, IsSynced, Acc)
-                     end, S1, NewCands),
-    case Q of
-        [#w{entries = [#entry{client = FirstC}]}|_]
-          when is_pid(L), L =/= FirstC ->
-            %% We have leader contention! Can happen in the process of
-            %% netsplit recovery. Set leader = undefined to put us in
-            %% the safe loop, and wait for a new leader to be elected.
-            S2#st{leader = undefined};
-        _ ->
-            S2
-    end;
+include_node(N, #st{agent = A, lock = Lock, nodes = Nodes} = S) ->
+    ?event({include_node, N}),
+    locks_agent:lock_nowait(A, Lock, write, [N], all_alive),
+    S#st{nodes = [N|Nodes]}.
+
+locks_info(#locks_info{lock = #lock{object = Lock} = L,
+                       where = Node} = _I, #st{lock = Lock} = S) ->
+    lock_info(L, Node, S);
 locks_info(_, S) ->
     S.
 
-new_cands(Node, Q, #st{candidates = Cands}) ->
-    Clients = [C || #w{entries = [#entry{client = C}]} <- Q,
-                    C =/= self(), node(C) == Node],
-    Clients -- Cands.
+lock_info(#lock{queue = Q}, Node, #st{} = S) ->
+    NewCands = new_cands(Node, Q, S),
+    lists:foldl(fun(C, #st{nodes = Nodes} = Acc) ->
+                        N = node(C),
+                        SAcc = case lists:member(N, Nodes) of
+                                   true -> Acc;
+                                   false -> include_node(N, Acc)
+                               end,
+                        add_cand(C, SAcc)
+                end, S, NewCands).
 
-synced_lock(Node, Q, #st{held_locks = Held, synced_locks = Synced} = S) ->
-    case Q of
-        [#w{entries = [#entry{client = C}]}|_] when C == self() ->
-            case {lists:member(Node, Synced), lists:member(Node, Held)} of
-                {true, _}      -> {true, S};
-                {false, true}  -> {false, S};
-                {false, false} -> {false, S#st{held_locks = [Node|Held]}}
-            end;
-        _ ->
-            {false, S#st{held_locks = Held -- [Node],
-                         synced_locks = Synced -- [Node]}}
-    end.
+new_cands(_Node, Q, #st{candidates = Cands}) ->
+    Clients = [C || #w{entries = [#entry{client = C}]} <- Q,
+                    C =/= self()],
+    Clients -- Cands.
 
 down({'DOWN', Ref, _, Pid, _} = Msg,
      #st{leader = LPid, mod = M, mod_state = MSt} = S) ->
@@ -718,9 +734,9 @@ down({'DOWN', Ref, _, Pid, _} = Msg,
 	    maybe_remove_cand(Type, Pid, S1)
     end.
 
-add_cand(Client, _, S) when Client == self() ->
+add_cand(Client, S) when Client == self() ->
     S;
-add_cand(Client, IsSynced, #st{candidates = Cands, role = Role} = S) ->
+add_cand(Client, #st{candidates = Cands, role = Role} = S) ->
     case lists:member(Client, Cands) of
 	false ->
             monitor_cand(Client),
@@ -729,7 +745,7 @@ add_cand(Client, IsSynced, #st{candidates = Cands, role = Role} = S) ->
 		    Client ! {?MODULE, am_worker, self()},
                     S1;
 	       true ->
-                    maybe_announce_leader(Client, IsSynced, S1)
+                    maybe_announce_leader(Client, candidate, S1)
             end;
 	true ->
 	    S
@@ -739,23 +755,28 @@ monitor_cand(Client) ->
     MRef = erlang:monitor(process, Client),
     put({?MODULE, monitor, MRef}, candidate).
 
-maybe_announce_leader(Pid, IsSynced,
-                      #st{leader = L, mod = M, mod_state = MSt} = S) ->
+maybe_announce_leader(Pid, Type, #st{leader = L, mod = M,
+                                     mod_state = MSt} = S) ->
+    IsSynced = is_synced(Pid, Type, S),
     if L == self(), IsSynced == false ->
 	    case M:elected(MSt, opaque(S), Pid) of
 		{reply, Msg, MSt1} ->
 		    Pid ! msg(am_leader, Msg),
-                    S#st{mod_state = MSt1, synced = [Pid|S#st.synced]};
-		{ok, MSt1} ->
-		    S#st{mod_state = MSt1};
+                    mark_as_synced(Pid, Type, S#st{mod_state = MSt1});
 		{ok, Msg, MSt1} ->
-		    do_broadcast(S#st{mod_state = MSt1}, Msg);
+                    Pid ! msg(am_leader, Msg),
+		    S1 = do_broadcast(S#st{mod_state = MSt1}, Msg),
+                    mark_as_synced(Pid, Type, S1);
+                {ok, AmLdrMsg, FromLdrMsg, MSt1} ->
+                    Pid ! msg(am_leader, AmLdrMsg),
+                    S1 = do_broadcast(S#st{mod_state = MSt1}, FromLdrMsg),
+                    mark_as_synced(Pid, Type, S1);
                 {surrender, Other, MSt1} ->
                     case lists:member(Other, S#st.candidates) of
                         true ->
                             locks_agent:surrender_nowait(
                               S#st.agent, S#st.lock, Other, S#st.nodes),
-                            S#st{leader = undefined};
+                            S#st{mod_state = MSt1, leader = undefined};
                         false ->
                             error({cannot_surrender, Other})
                     end
@@ -763,6 +784,16 @@ maybe_announce_leader(Pid, IsSynced,
        true ->
 	    S
     end.
+
+is_synced(Pid, worker, #st{synced_workers = Synced}) ->
+    lists:member(Pid, Synced);
+is_synced(Pid, candidate, #st{synced = Synced}) ->
+    lists:member(Pid, Synced).
+
+mark_as_synced(Pid, worker, #st{synced_workers = Synced} = S) ->
+    S#st{synced_workers = [Pid|Synced]};
+mark_as_synced(Pid, candidate, #st{synced = Synced} = S) ->
+    S#st{synced = [Pid|Synced]}.
 
 maybe_remove_cand(candidate, Pid, #st{candidates = Cs, synced = Synced,
                                       leader = L,
@@ -776,11 +807,17 @@ maybe_remove_cand(candidate, Pid, #st{candidates = Cs, synced = Synced,
 maybe_remove_cand(worker, Pid, #st{workers = Ws} = S) ->
     S#st{workers = Ws -- [Pid]}.
 
+become_leader(#st{agent = A} = S) ->
+    {_, Locks} = locks_agent:lock_info(A),
+    S1 = lists:foldl(
+           fun(#lock{object = {OID,Node}} = L, Sx) ->
+                   lock_info(L#lock{object = OID}, Node, Sx)
+           end, S, Locks),
+    become_leader_(S1).
 
-become_leader(#st{leader = L, mod = M, mod_state = MSt,
-                  candidates = Cands, synced = Synced,
-                  held_locks = Held, synced_locks = SyncedLocks,
-                  workers = Ws, synced_workers = SyncedWs} = S)
+become_leader_(#st{leader = L, mod = M, mod_state = MSt,
+                   candidates = Cands, synced = Synced,
+                   workers = Ws, synced_workers = SyncedWs} = S)
   when L == self() ->
     ?event(become_leader_again, S),
     case {Cands -- Synced, Ws -- SyncedWs} of
@@ -793,8 +830,7 @@ become_leader(#st{leader = L, mod = M, mod_state = MSt,
                     {ok, MSt1}             -> {[], MSt1};
                     {error, Reason}        -> error(Reason)
             end,
-            S1 = S#st{mod_state = ModSt1,
-                      synced_locks = union(Held, SyncedLocks)},
+            S1 = S#st{mod_state = ModSt1},
             case Broadcast of
                 [] -> S1;
                 {AmLeaderMsg, FromLeaderMsg} ->
@@ -802,7 +838,7 @@ become_leader(#st{leader = L, mod = M, mod_state = MSt,
                       do_broadcast(S1, FromLeaderMsg), AmLeaderMsg)
             end
     end;
-become_leader(#st{mod = M, mod_state = MSt} = S) ->
+become_leader_(#st{mod = M, mod_state = MSt} = S) ->
     ?event(become_leader, S),
     case M:elected(MSt, opaque(S), undefined) of
 	{ok, Msg, MSt1} ->
@@ -877,6 +913,10 @@ do_broadcast(#st{synced = Synced, synced_workers = SyncedWs} = S, Msg) ->
     do_broadcast_(SyncedWs, FromLeader),
     S.
 
+send_all(#st{candidates = Cands, workers = Ws}, Msg) ->
+    do_broadcast_(Cands, Msg),
+    do_broadcast_(Ws, Msg).
+
 do_broadcast_(Pids, Msg) when is_list(Pids) ->
     [P ! Msg || P <- Pids],
     ok.
@@ -889,11 +929,11 @@ from_leader(_OtherL, _Msg, S) ->
 
 leader_announced(L, Msg, #st{leader = L, mod = M, mod_state = MSt} = S) ->
     callback(M:surrendered(MSt, Msg, opaque(S)),
-             S#st{synced_locks = []}); % precaution
+             S#st{synced = [], synced_workers = []});
 leader_announced(L, Msg, #st{mod = M, mod_state = MSt} = S) ->
     %% Ref = erlang:monitor(process, L),
     %% put({?MODULE,monitor,Ref}, candidate),
-    S1 = S#st{leader = L, synced_locks = []}, % precaution
+    S1 = S#st{leader = L, synced = [], synced_workers = []},
     callback(M:surrendered(MSt, Msg, opaque(S1)), S1).
 
 worker_announced(W, #st{workers = Workers} = S) ->
@@ -903,7 +943,7 @@ worker_announced(W, #st{workers = Workers} = S) ->
 	false ->
 	    Ref = erlang:monitor(process, W),
 	    put({?MODULE,monitor,Ref}, worker),
-	    maybe_announce_leader(W, true, S#st{workers = [W|Workers]})
+	    maybe_announce_leader(W, worker, S#st{workers = [W|Workers]})
     end.
 
 get_opt(K, Opts) ->
