@@ -412,9 +412,9 @@ with largest reference surrenders the object it locks.
 
 
 <table width="100%" border="0" summary="list of modules">
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks.md" class="module">locks</a></td></tr>
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_agent.md" class="module">locks_agent</a></td></tr>
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_leader.md" class="module">locks_leader</a></td></tr>
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_server.md" class="module">locks_server</a></td></tr>
-<tr><td><a href="https://github.com/uwiger/locks/blob/master/doc/locks_ttb.md" class="module">locks_ttb</a></td></tr></table>
+<tr><td><a href="locks.md" class="module">locks</a></td></tr>
+<tr><td><a href="locks_agent.md" class="module">locks_agent</a></td></tr>
+<tr><td><a href="locks_leader.md" class="module">locks_leader</a></td></tr>
+<tr><td><a href="locks_server.md" class="module">locks_server</a></td></tr>
+<tr><td><a href="locks_ttb.md" class="module">locks_ttb</a></td></tr></table>
 

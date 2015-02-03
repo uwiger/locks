@@ -119,14 +119,13 @@
 
 -define(myclient,State#state.client).
 
--define(rf(R), record_fields(R) -> record_info(fields, R)).
-?rf(state);
-?rf(req);
-?rf(lock);
-?rf(locks_info);
-?rf(w);
-?rf(r);
-?rf(entry);
+record_fields(state     ) -> record_info(fields, state);
+record_fields(req       ) -> record_info(fields, req);
+record_fields(lock      ) -> record_info(fields, lock);
+record_fields(locks_info) -> record_info(fields, locks_info);
+record_fields(w         ) -> record_info(fields, w);
+record_fields(r         ) -> record_info(fields, r);
+record_fields(entry     ) -> record_info(fields, entry);
 record_fields(_) ->
     no.
 
@@ -152,7 +151,7 @@ start_link(Options) when is_list(Options) ->
     start(lists:keystore(link, 1, Options, {link, true})).
 
 -spec start() -> {ok, pid()}.
-%% @equiv start([]).
+%% @equiv start([])
 start() ->
     start([]).
 

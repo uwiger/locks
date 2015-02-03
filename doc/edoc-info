@@ -1,3 +1,4 @@
+%% encoding: UTF-8
 {application,locks}.
 {packages,[]}.
-{modules,[locks,locks_agent,locks_leader,locks_server]}.
+{modules,[locks,locks_agent,locks_leader,locks_server,locks_ttb]}.

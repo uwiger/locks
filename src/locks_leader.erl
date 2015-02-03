@@ -155,13 +155,12 @@
 -callback handle_cast(msg(), mod_state(), leader_info()) -> cb_return().
 -callback handle_info(msg(), mod_state(), leader_info()) -> cb_return().
 
--define(rf(R), record_fields(R) -> record_info(fields, R)).
-?rf(st);
-?rf(lock);
-?rf(entry);
-?rf(w);
-?rf(r);
-?rf(locks_info);
+record_fields(st        ) -> record_info(fields, st);
+record_fields(lock      ) -> record_info(fields, lock);
+record_fields(entry     ) -> record_info(fields, entry);
+record_fields(w         ) -> record_info(fields, w);
+record_fields(r         ) -> record_info(fields, r);
+record_fields(locks_info) -> record_info(fields, locks_info);
 record_fields(_) ->
     no.
 
