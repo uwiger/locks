@@ -803,7 +803,11 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                         true  -> watch_node(Node);
                         false -> ignore
                     end,
-                    {noreply, S1}
+                    if PRs =/= [] ->
+                            {noreply, check_if_done(S1)};
+                       true ->
+                            {noreply, S1}
+                    end
             end
     end.
 
