@@ -814,11 +814,12 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
     ets_match_delete(Locks, #lock{object = {'_',Node}, _ = '_'}),
     ets_match_delete(Agents, {{'_',{'_',Node}}}),
     Down1 = [Node|Down -- [Node]],
-    S1 = S#state{down = Down1, interesting = prune_interesting(I, node, Node)},
+    S1 = S#state{down = Down1, interesting = prune_interesting(I, node, Node),
+                 monitored = lists:keydelete(Node, 1, Mon)},
     case {requests_with_node(Node, Reqs),
           requests_with_node(Node, Pending)} of
         {[], []} ->
-            {noreply, S#state{down = lists:keydelete(Node, 1, Mon)}};
+            {noreply, S1};
         {Rs, PRs} ->
             move_requests(Rs, Reqs, Pending),
             case S1#state.await_nodes of
