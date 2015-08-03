@@ -456,9 +456,9 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
     Agent =
 	case Role of
 	    candidate ->
-		net_kernel:monitor_nodes(true),
 		{ok, A} = locks_agent:start([{notify,true},
-                                             {await_nodes, true}]),
+                                             {await_nodes, true},
+                                             {monitor_nodes, true}]),
 		locks_agent:lock_nowait(
 		  A, Lock, write, AllNodes, all_alive),
 		A;
