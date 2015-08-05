@@ -709,6 +709,7 @@ handle_info({nodedown,_}, S) ->
     %% We react on 'DOWN' messages above instead
     {noreply, S};
 handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending,
+                                            requests = Reqs,
                                             monitor_nodes = MonNodes,
                                             client = C} = S) ->
     ?event(Msg),
@@ -720,7 +721,10 @@ handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending,
     case lists:member(N, Down) of
         true ->
             S1 = S#state{down = Down -- [N]},
-            case requests_with_node(N, Pending) of
+            {R, P} = Res = {requests_with_node(N, Reqs),
+                            requests_with_node(N, Pending)},
+            ?event({{reqs, pending}, Res}),
+            case R ++ P of
                 [] ->
                     {noreply, S1};
                 Reissue ->
@@ -816,8 +820,10 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
     Down1 = [Node|Down -- [Node]],
     S1 = S#state{down = Down1, interesting = prune_interesting(I, node, Node),
                  monitored = lists:keydelete(Node, 1, Mon)},
-    case {requests_with_node(Node, Reqs),
-          requests_with_node(Node, Pending)} of
+    Res = {requests_with_node(Node, Reqs),
+           requests_with_node(Node, Pending)},
+    ?event({{reqs,pending}, Res}),
+    case Res of
         {[], []} ->
             {noreply, S1};
         {Rs, PRs} ->
