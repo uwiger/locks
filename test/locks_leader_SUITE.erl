@@ -82,8 +82,14 @@ end_per_group(_Group, Config) ->
 init_per_testcase(_Case, Config) ->
     Config.
 
+end_per_testcase(Case, Config) when Case==gdict_all_nodes;
+                                    Case==gdict_netsplit ->
+    proxy_multicall(get_slave_nodes(Config),
+                    application, stop, [locks]),
+    ok;
 end_per_testcase(_Case, _Config) ->
     ok.
+
 
 %% ============================================================
 %% Test cases
@@ -104,6 +110,9 @@ local_dict(_Config) ->
     ok.
 
 gdict_all_nodes(Config) ->
+    with_trace(fun gdict_all_nodes_/1, Config, "leader_tests_all_nodes").
+
+gdict_all_nodes_(Config) ->
     [H|T] = Ns = get_slave_nodes(Config),
     Name = [?MODULE,?LINE],
     ok = call_proxy(H, ?MODULE, connect_nodes, [T]),
@@ -119,7 +128,7 @@ gdict_all_nodes(Config) ->
            fun({_Node,{ok,1}}) -> false;
               (_) -> true
            end,
-           lists:zip(Ns, [gdict:find(a,D) || D <- Dicts])),
+           lists:zip(Ns, [?retry({ok,1}, gdict:find(a,D)) || D <- Dicts])),
     [exit(D, kill) || D <- Dicts],
     proxy_multicall(Ns, application, stop, [locks]),
     ok.
@@ -142,7 +151,7 @@ gdict_netsplit_(Config) ->
     locks_ttb:event({dicts_created, lists:zip(Ns, Dicts)}),
     ok = ?retry(ok, gdict:store(a, 1, Da)),
     ok = gdict:store(b, 2, Dc),
-    {ok, 1} = gdict:find(a, Db),
+    {ok, 1} = ?retry({ok,1}, gdict:find(a, Db)),
     error = gdict:find(a, Dc),
     [X,X] = [locks_leader:info(Dx, leader) || Dx <- [Da,Db]],
     locks_ttb:event({leader_consensus, [Da,Db], X}),
@@ -150,8 +159,8 @@ gdict_netsplit_(Config) ->
     locks_ttb:event({leader_consensus, [Dc,Dd,De], Y}),
     true = (X =/= Y),
     {ok, 2} = ?retry({ok,2}, gdict:find(b, Dc)),
-    {ok, 2} = gdict:find(b, Dd),
-    {ok, 2} = gdict:find(b, De),
+    {ok, 2} = ?retry({ok,2}, gdict:find(b, Dd)),
+    {ok, 2} = ?retry({ok,2}, gdict:find(b, De)),
     error = gdict:find(b, Da),
     locks_ttb:event(reconnecting),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
@@ -161,7 +170,7 @@ gdict_netsplit_(Config) ->
                          call_proxy(A, ?MODULE, leader_nodes, [Dicts])),
     locks_ttb:event({leader_consensus, Ns, Z}),
     {ok, 1} = ?retry({ok,1}, gdict:find(a, Dc)),
-    {ok, 2} = gdict:find(b, Da),
+    {ok, 2} = ?retry({ok,2}, gdict:find(b, Da)),
     [exit(Dx, kill) || Dx <- Dicts],
     proxy_multicall(Ns, application, stop, [locks]),
     ok.
@@ -200,20 +209,30 @@ start_incremental(N, Alive, Rest, Name) ->
 
 with_trace(F, Config, Name) ->
     Ns = get_slave_nodes(Config),
-    locks_ttb:trace_nodes([node()|Ns], Name),
+    Pats = [{test_cb, event, 3, []}|locks_ttb:default_patterns()],
+    Flags = locks_ttb:default_flags(),
+    locks_ttb:trace_nodes([node()|Ns], Pats, Flags, [{file, Name}]),
     try F(Config)
     catch
         error:R ->
-            locks_ttb:stop(),
+            ttb_stop(),
             Stack = erlang:get_stacktrace(),
             ct:log("Error ~p; Stack = ~p~n", [R, Stack]),
             erlang:error(R);
         exit:R ->
-            locks_ttb:stop(),
+            ttb_stop(),
             exit(R)
     end,
     locks_ttb:stop_nofetch(),
     ok.
+
+ttb_stop() ->
+    Dir = locks_ttb:stop(),
+    Out = filename:join(filename:dirname(Dir),
+                        filename:basename(Dir) ++ ".txt"),
+    locks_ttb:format(Dir, Out),
+    ct:log("Formatted trace log in ~s~n", [Out]).
+
 
 compile_dict() ->
     Lib = filename:absname(code:lib_dir(locks)),

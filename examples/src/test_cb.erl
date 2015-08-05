@@ -51,10 +51,18 @@
 	 terminate/2,
 	 code_change/4]).
 
--record(st, {am_leader = false,
+-export([record_fields/1]).
+
+-record(cb, {am_leader = false,
 	     dict}).
 
--define(event(E), event(?LINE, E)).
+-define(event(E), event(?LINE, E, none)).
+-define(event(E, S), event(?LINE, E, S)).
+
+record_fields(cb) -> record_info(fields, cb);
+record_fields(st) -> locks_leader:record_fields(st);
+record_fields(_) ->
+    no.
 
 %% @spec init(Arg::term()) -> {ok, State}
 %%
@@ -64,7 +72,7 @@
 %%
 init(Dict) ->
     ?event({init, Dict}),
-    {ok, #st{dict = Dict}}.
+    {ok, #cb{dict = Dict}}.
 
 %% @spec elected(State::state(), I::info(), Cand::pid() | undefined) ->
 %%   {ok, Broadcast, NState}
@@ -114,27 +122,26 @@ init(Dict) ->
 %% Example:
 %%
 %% <pre lang="erlang">
-%%   elected(#st{dict = Dict} = St, _I, undefined) -&gt;
+%%   elected(#cb{dict = Dict} = St, _I, undefined) -&gt;
 %%       {ok, Dict, St};
-%%   elected(#st{dict = Dict} = St, _I, Pid) when is_pid(Pid) -&gt;
+%%   elected(#cb{dict = Dict} = St, _I, Pid) when is_pid(Pid) -&gt;
 %%       %% reply only to Pid
 %%       {reply, Dict, St}.
 %% </pre>
 %% @end
 %%
-elected(#st{dict = Dict} = S, I, undefined) ->
-    ?event(elected_leader),
+elected(#cb{dict = Dict} = S, I, _) ->
+    ?event({elected_leader, I}),
     case locks_leader:new_candidates(I) of
 	[] ->
-	    ?event({elected, Dict}),
-	    {ok, {sync, Dict}, S#st{am_leader = true}};
+	    ?event({elected, Dict}, S),
+	    {ok, {sync, Dict}, S#cb{am_leader = true}};
 	Cands ->
 	    ?event({new_candidates, Cands}),
 	    NewDict = merge_dicts(Dict, I),
-	    {ok, {sync, NewDict}, S#st{am_leader = true, dict = NewDict}}
-    end;
-elected(#st{dict = Dict} = S, _E, Pid) when is_pid(Pid) ->
-    {reply, {sync, Dict}, S#st{am_leader = true}}.
+            ?event({merge_result, NewDict}),
+	    {ok, {sync, NewDict}, S#cb{am_leader = true, dict = NewDict}}
+    end.
 
 %% This is sub-optimal, but it's only an example!
 merge_dicts(D, I) ->
@@ -167,9 +174,9 @@ merge_dicts(D, I) ->
 %%      {ok, LeaderDict}.
 %% </pre>
 %% @end
-surrendered(#st{dict = _OurDict} = S, {sync, LeaderDict}, _I) ->
+surrendered(#cb{dict = _OurDict} = S, {sync, LeaderDict}, _I) ->
     ?event({surrendered, LeaderDict}),
-    {ok, S#st{dict = LeaderDict, am_leader = false}}.
+    {ok, S#cb{dict = LeaderDict, am_leader = false}}.
 
 %% @spec handle_DOWN(Candidate::pid(), State::state(), I::info()) ->
 %%    {ok, NState} | {ok, Broadcast, NState}
@@ -206,10 +213,10 @@ handle_DOWN(_Pid, S, _I) ->
 %% Example:
 %%
 %% <pre lang="erlang">
-%%   handle_leader_call({store,F}, From, #st{dict = Dict} = S, E) -&gt;
+%%   handle_leader_call({store,F}, From, #cb{dict = Dict} = S, E) -&gt;
 %%       NewDict = F(Dict),
-%%       {reply, ok, {store, F}, S#st{dict = NewDict}};
-%%   handle_leader_call({leader_lookup,F}, From, #st{dict = Dict} = S, E) -&gt;
+%%       {reply, ok, {store, F}, S#cb{dict = NewDict}};
+%%   handle_leader_call({leader_lookup,F}, From, #cb{dict = Dict} = S, E) -&gt;
 %%       Reply = F(Dict),
 %%       {reply, Reply, S}.
 %% </pre>
@@ -221,14 +228,16 @@ handle_DOWN(_Pid, S, _I) ->
 %% leader; normally, lookups are served locally and updates by the leader,
 %% which can lead to race conditions.
 %% @end
-handle_leader_call({store,F} = Op, _From, #st{dict = Dict} = S, _I) ->
+handle_leader_call({store,F} = Op, _From, #cb{dict = Dict} = S, _I) ->
     ?event({handle_leader_call, Op}),
     NewDict = F(Dict),
-    {reply, ok, {store, F}, S#st{dict = NewDict}};
-handle_leader_call({leader_lookup,F} = Op, _From, #st{dict = Dict} = S, _I) ->
+    ?event({new_dict, NewDict}),
+    {reply, ok, {store, F}, S#cb{dict = NewDict}};
+handle_leader_call({leader_lookup,F} = Op, _From, #cb{dict = Dict} = S, _I) ->
     ?event({handle_leader_call, Op}),
     Reply = F(Dict),
-    {reply, Reply, S#st{dict = Dict}}.
+    ?event({reply, Reply}),
+    {reply, Reply, S#cb{dict = Dict}}.
 
 
 %% @spec handle_leader_cast(Msg::term(), State::term(), I::info()) ->
@@ -251,12 +260,14 @@ handle_leader_cast(_Msg, S, _I) ->
 %% In this particular module, the leader passes an update function to be
 %% applied to the candidate's state.
 %% @end
-from_leader({sync, D}, #st{} = S, _I) ->
-    {ok, S#st{dict = D}};
-from_leader({store,F} = Op, #st{dict = Dict} = S, _I) ->
-    ?event({from_leader, Op}),
+from_leader({sync, D} = Msg, #cb{} = S, _I) ->
+    ?event({from_leader, Msg}, S),
+    {ok, S#cb{dict = D}};
+from_leader({store,F} = Op, #cb{dict = Dict} = S, _I) ->
+    ?event({from_leader, Op}, S),
     NewDict = F(Dict),
-    {ok, S#st{dict = NewDict}}.
+    ?event({new_dict, NewDict}),
+    {ok, S#cb{dict = NewDict}}.
 
 %% @spec handle_call(Request::term(), From::callerRef(), State::state(),
 %%                   I::info()) ->
@@ -275,15 +286,18 @@ from_leader({store,F} = Op, #st{dict = Dict} = S, _I) ->
 %% used to it from gen_server.
 %% @end
 %%
-handle_call(merge, _From, #st{am_leader = AmLeader,
+handle_call(merge, _From, #cb{am_leader = AmLeader,
 			      dict = Dict} = S, _I) ->
+    ?event({handle_call, merge}, S),
     if AmLeader ->
 	    {reply, {true, Dict}, S};
        true ->
 	    {reply, false, S}
     end;
-handle_call({lookup, F}, _From, #st{dict = Dict} = S, _I) ->
+handle_call({lookup, F}, _From, #cb{dict = Dict} = S, _I) ->
+    ?event({handle_call, lookup}, S),
     Reply = F(Dict),
+    ?event({reply, Reply}),
     {reply, Reply, S}.
 
 %% @spec handle_cast(Msg::term(), State::state(), I::info()) ->
@@ -331,5 +345,5 @@ terminate(_Reason, _S) ->
     ok.
 
 
-event(_Line, _Event) ->
+event(_Line, _Event, _State) ->
     ok.
