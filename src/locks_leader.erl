@@ -178,7 +178,8 @@ candidates(#st{candidates = C}) ->
 %% new candidates to see whether one of them was a leader, which could
 %% be the case if the candidates appeared after a healed netsplit.
 %% @end
-new_candidates(#st{candidates = C, synced = S}) ->
+new_candidates(#st{candidates = C, synced = S} = St) ->
+    ?event({new_candidates, St}),
     C -- S.
 
 -spec workers(election()) -> [pid()].
@@ -456,9 +457,9 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
     Agent =
 	case Role of
 	    candidate ->
-		net_kernel:monitor_nodes(true),
 		{ok, A} = locks_agent:start([{notify,true},
-                                             {await_nodes, true}]),
+                                             {await_nodes, true},
+                                             {monitor_nodes, true}]),
 		locks_agent:lock_nowait(
 		  A, Lock, write, AllNodes, all_alive),
 		A;
@@ -756,6 +757,7 @@ monitor_cand(Client) ->
 
 maybe_announce_leader(Pid, Type, #st{leader = L, mod = M,
                                      mod_state = MSt} = S) ->
+    ?event({maybe_announce_leader, Pid, Type}, S),
     IsSynced = is_synced(Pid, Type, S),
     if L == self(), IsSynced == false ->
 	    case M:elected(MSt, opaque(S), Pid) of

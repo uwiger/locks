@@ -52,10 +52,7 @@ handler(Fd, Trace, _, {Tp,Diff} = Acc) ->
     case Trace of
 	{trace_ts,{_, _, Node},
 	 call,
-	 {Mod, event, [Line, Evt, State]}, TS} when Mod==locks_agent;
-						    Mod==locks_server;
-						    Mod==locks_leader;
-						    Mod==?MODULE ->
+	 {Mod, event, [Line, Evt, State]}, TS} when is_integer(Line) ->
 	    Tdiff = tdiff(TS, Tp),
 	    Diff1 = Diff + Tdiff,
 	    print(Fd, Node, Mod, Line, Evt, State, Diff1),
@@ -87,11 +84,27 @@ print_tail(St, Mod, Col) ->
     [{put_chars, unicode, [lists:duplicate(Col,$\s), Cs]}, nl].
 
 pp(Term, Col, Mod) ->
-    io_lib_pretty:print(Term, [{column, Col},
-			       {line_length, 80},
-			       {depth, -1},
-			       {max_chars, ?CHAR_MAX},
-			       {record_print_fun, record_print_fun(Mod)}]).
+    io_lib_pretty:print(pp_term(Term),
+                        [{column, Col},
+                         {line_length, 80},
+                         {depth, -1},
+                         {max_chars, ?CHAR_MAX},
+                         {record_print_fun, record_print_fun(Mod)}]).
+
+pp_term(D) when element(1,D) == dict ->
+    try {'$dict', dict:to_list(D)}
+    catch
+        error:_ ->
+            list_to_tuple([pp_term(T) || T <- tuple_to_list(D)])
+    end;
+pp_term(T) when is_tuple(T) ->
+    list_to_tuple([pp_term(Trm) || Trm <- tuple_to_list(T)]);
+pp_term(L) when is_list(L) ->
+    [pp_term(T) || T <- L];
+pp_term(T) ->
+    T.
+
+
 
 tdiff(_, 0) -> 0;
 tdiff(TS, T0) ->

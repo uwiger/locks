@@ -22,10 +22,10 @@ examples: compile
 	rebar compile
 
 test:
-	rebar clean compile eunit
+	rebar clean compile eunit ct
 
 test_debug:
-	rebar clean compile eunit eunit_compile_opts="\[\{d,'DEBUG'\}\]"
+	rebar clean compile eunit ct eunit_compile_opts="\[\{d,'DEBUG'\}\]"
 
 doc:
 	rebar get-deps compile doc

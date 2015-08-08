@@ -48,6 +48,7 @@
 	 lock_objects/2,
          surrender_nowait/4,
 	 await_all_locks/1,
+         monitor_nodes/2,
          change_flag/3,
 	 lock_info/1,
          transaction_status/1,
@@ -104,6 +105,7 @@
           down = []        :: [node()],
           monitored = []   :: [{node(), reference()}],
           await_nodes = false :: boolean(),
+          monitor_nodes = false :: boolean(),
           pending          :: ets:tab(),
           sync = []        :: [#lock{}],
           client           :: pid(),
@@ -182,6 +184,12 @@ start() ->
 %% request(s) cannot be granted without the lost nodes. If `{await_nodes,true}',
 %% the agent will wait for the nodes to reappear, and reclaim the lock(s) when
 %% they do.
+%%
+%% * `{monitor_nodes, boolean()}' - default: `false'. Works like
+%% {@link net_kernel:monitor_nodes/1}, but `nodedown' and `nodeup' messages are
+%% sent when the `locks' server on a given node either appears or disappears.
+%% The messages (`{nodeup,Node}' and `{nodedown,Node}') are sent only to
+%% the client. Can also be toggled using {@link monitor_nodes/2}.
 %%
 %% * `{notify, boolean()}' - default: `false'. If `{notify, true}', the client
 %% will receive `{locks_agent, Agent, Info}' messages, where `Info' is either
@@ -318,6 +326,17 @@ begin_transaction(Objects, Opts) ->
 await_all_locks(Agent) ->
     call(Agent, await_all_locks,infinity).
 
+-spec monitor_nodes(agent(), boolean()) -> boolean().
+%% @doc Toggles monitoring of nodes, like net_kernel:monitor_nodes/1.
+%%
+%% Works like {@link net_kernel:monitor_nodes/1}, but `nodedown' and `nodeup'
+%% messages are sent when the `locks' server on a given node either appears
+%% or disappears. In this sense, the monitoring will signal when a viable
+%% `locks' node becomes operational (or inoperational).
+%% The messages (`{nodeup,Node}' and `{nodedown,Node}') are sent only to
+%% the client.
+monitor_nodes(Agent, Bool) when is_boolean(Bool) ->
+    call(Agent, {monitor_nodes, Bool}).
 
 -spec end_transaction(agent()) -> ok.
 %% @doc Ends the transaction, terminating the agent.
@@ -462,6 +481,7 @@ init(Opts) ->
                  false -> []
              end,
     AwaitNodes = proplists:get_value(await_nodes, Opts, false),
+    MonNodes = proplists:get_value(monitor_nodes, Opts, false),
     net_kernel:monitor_nodes(true),
     {ok,#state{
            locks = ets_new(locks, [ordered_set, {keypos, #lock.object}]),
@@ -470,6 +490,7 @@ init(Opts) ->
            down = [],
            monitored = orddict:new(),
            await_nodes = AwaitNodes,
+           monitor_nodes = MonNodes,
            pending = ets_new(pending, [bag, {keypos, #req.object}]),
            sync = [],
            client = Client,
@@ -486,6 +507,8 @@ handle_call(transaction_status, _From, #state{status = Status} = State) ->
     {reply, Status, State};
 handle_call(await_all_locks, {Client, Tag}, State) ->
     {noreply, check_if_done(add_waiter(wait, Client, Tag, State))};
+handle_call({monitor_nodes, Bool}, _From, St) when is_boolean(Bool) ->
+    {reply, St#state.monitor_nodes, St#state{monitor_nodes = Bool}};
 handle_call(stop, {Client, _}, State) when Client==?myclient ->
     {stop, normal, ok, State};
 handle_call(R, _, State) ->
@@ -677,7 +700,7 @@ handle_info({'DOWN',_,_,_,_}, S) ->
     {noreply, S};
 handle_info({nodeup, N} = _Msg, #state{down = Down} = S) ->
     ?event(_Msg),
-    case lists:member(N, Down) of
+    case S#state.monitor_nodes orelse lists:member(N, Down) of
         true  -> watch_node(N);
         false -> ignore
     end,
@@ -685,12 +708,23 @@ handle_info({nodeup, N} = _Msg, #state{down = Down} = S) ->
 handle_info({nodedown,_}, S) ->
     %% We react on 'DOWN' messages above instead
     {noreply, S};
-handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending} = S) ->
+handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending,
+                                            requests = Reqs,
+                                            monitor_nodes = MonNodes,
+                                            client = C} = S) ->
     ?event(Msg),
+    if MonNodes ->
+            C ! {nodeup, N};
+       true ->
+            ignore
+    end,
     case lists:member(N, Down) of
         true ->
             S1 = S#state{down = Down -- [N]},
-            case requests_with_node(N, Pending) of
+            {R, P} = Res = {requests_with_node(N, Reqs),
+                            requests_with_node(N, Pending)},
+            ?event({{reqs, pending}, Res}),
+            case R ++ P of
                 [] ->
                     {noreply, S1};
                 Reissue ->
@@ -777,16 +811,21 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                              pending = Pending,
                              monitored = Mon, locks = Locks,
                              interesting = I,
-                             agents = Agents} = S) ->
+                             agents = Agents,
+                             monitor_nodes = MonNodes} = S) ->
     ?event({handle_nodedown, Node}, S),
+    handle_monitor_on_down(Node, S),
     ets_match_delete(Locks, #lock{object = {'_',Node}, _ = '_'}),
     ets_match_delete(Agents, {{'_',{'_',Node}}}),
     Down1 = [Node|Down -- [Node]],
-    S1 = S#state{down = Down1, interesting = prune_interesting(I, node, Node)},
-    case {requests_with_node(Node, Reqs),
-          requests_with_node(Node, Pending)} of
+    S1 = S#state{down = Down1, interesting = prune_interesting(I, node, Node),
+                 monitored = lists:keydelete(Node, 1, Mon)},
+    Res = {requests_with_node(Node, Reqs),
+           requests_with_node(Node, Pending)},
+    ?event({{reqs,pending}, Res}),
+    case Res of
         {[], []} ->
-            {noreply, S#state{down = lists:keydelete(Node, 1, Mon)}};
+            {noreply, S1};
         {Rs, PRs} ->
             move_requests(Rs, Reqs, Pending),
             case S1#state.await_nodes of
@@ -799,7 +838,8 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                             {stop, {cannot_lock_objects, Lost}, S1}
                     end;
                 true ->
-                    case lists:member(Node, nodes()) of
+                    case MonNodes == false
+                        andalso lists:member(Node, nodes()) of
                         true  -> watch_node(Node);
                         false -> ignore
                     end,
@@ -810,6 +850,20 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                     end
             end
     end.
+
+handle_monitor_on_down(_, #state{monitor_nodes = false}) ->
+    ok;
+handle_monitor_on_down(Node, #state{monitor_nodes = true,
+                                    client = C}) ->
+    C ! {nodedown, Node},
+    case lists:member(Node, nodes()) of
+        true ->
+            watch_node(Node);
+        false ->
+            ignore
+    end,
+    ok.
+
 
 prune_interesting(I, node, Node) ->
     [OID || {_, N} = OID <- I, N =/= Node];
@@ -859,7 +913,8 @@ ensure_monitor_(Locker, Node, Mon) ->
             orddict:store(Node, Ref, Mon)
     end.
 
-request_lock({OID, Node}, Mode, #state{client = Client} = State) ->
+request_lock({OID, Node} = _LockID, Mode, #state{client = Client} = State) ->
+    ?event({request_lock, _LockID}),
     P = {?LOCKER, Node},
     erlang:monitor(process, P),
     locks_server:lock(OID, [Node], Client, Mode),
@@ -946,7 +1001,7 @@ do_surrender(ShouldSurrender, ToObject, InvolvedAgents,
     NewDeadlocks = [{ShouldSurrender, ToObject} | Deadlocks],
     ?event({do_surrender, [{should_surrender, ShouldSurrender},
                            {to_object, ToObject},
-                           {involved_agents, InvolvedAgents}]}),
+                           {involved_agents, lists:sort(InvolvedAgents)}]}),
     if ShouldSurrender == self() ->
             request_surrender(ToObject, State1),
             send_surrender_info(InvolvedAgents, OldLock),
