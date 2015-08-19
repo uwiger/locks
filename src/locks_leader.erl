@@ -94,7 +94,7 @@
 
 -export([record_fields/1]).
 
--export_type([leader_info/0, mod_state/0, msg/0, election/0]).
+-export_type([mod_state/0, msg/0, election/0]).
 
 -type option() :: {role, candidate | worker}
                 | {resource, any()}.
@@ -104,7 +104,6 @@
 -type reply() :: any().
 -type from() :: {pid(), _Tag :: any()}.
 -type reason() :: any().
--opaque leader_info() :: fun( (atom()) -> [atom()] ).
 -type server_ref() :: atom() | {atom(), node()} | {global, term()} | {via, module(), term()} | pid().
 -type cb_return() ::
 	{ok, mod_state()}
@@ -143,17 +142,17 @@
 -opaque election() :: #st{}.
 
 -callback init(any()) -> mod_state().
--callback elected(mod_state(), leader_info(), undefined | pid()) ->
+-callback elected(mod_state(), election(), undefined | pid()) ->
     cb_return() | {reply, msg(), mod_state()}.
--callback surrendered(mod_state(), msg(), leader_info()) -> cb_return().
--callback handle_DOWN(pid(), mod_state(), leader_info()) -> cb_return().
--callback handle_leader_call(msg(), from(), mod_state(), leader_info()) ->
+-callback surrendered(mod_state(), msg(), election()) -> cb_return().
+-callback handle_DOWN(pid(), mod_state(), election()) -> cb_return().
+-callback handle_leader_call(msg(), from(), mod_state(), election()) ->
     cb_reply().
--callback handle_leader_cast(msg(), mod_state(), leader_info()) -> cb_return().
--callback from_leader(msg(), mod_state(), leader_info()) -> cb_return().
--callback handle_call(msg(), from(), mod_state(), leader_info()) -> cb_reply().
--callback handle_cast(msg(), mod_state(), leader_info()) -> cb_return().
--callback handle_info(msg(), mod_state(), leader_info()) -> cb_return().
+-callback handle_leader_cast(msg(), mod_state(), election()) -> cb_return().
+-callback from_leader(msg(), mod_state(), election()) -> cb_return().
+-callback handle_call(msg(), from(), mod_state(), election()) -> cb_reply().
+-callback handle_cast(msg(), mod_state(), election()) -> cb_return().
+-callback handle_info(msg(), mod_state(), election()) -> cb_return().
 
 record_fields(st        ) -> record_info(fields, st);
 record_fields(lock      ) -> record_info(fields, lock);
