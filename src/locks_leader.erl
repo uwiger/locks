@@ -105,7 +105,7 @@
 -type from() :: {pid(), _Tag :: any()}.
 -type reason() :: any().
 -opaque leader_info() :: fun( (atom()) -> [atom()] ).
--type server_ref() :: atom() | pid().
+-type server_ref() :: atom() | {atom(), node()} | {global, term()} | {via, module(), term()} | pid().
 -type cb_return() ::
 	{ok, mod_state()}
       | {ok, msg(), mod_state()}
