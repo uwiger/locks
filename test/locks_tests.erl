@@ -30,6 +30,7 @@ run_test_() ->
       [
        ?_test(simple_lock())
        , ?_test(one_lock_two_clients())
+       , ?_test(one_lock_wrr_clients())
        , ?_test(lock_merge())
        , ?_test(lock_upgrade1())
        , ?_test(lock_upgrade2())
@@ -81,6 +82,19 @@ one_lock_two_clients() ->
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+one_lock_wrr_clients() ->
+    L = [?MODULE, ?LINE],
+    script([1,2,3],
+           [{1, ?LINE, locks, lock, ['$agent', L, write], match({ok,[]})},
+            {2, ?LINE, locks, lock_nowait, ['$agent', L, read], match(ok)},
+            {3, ?LINE, locks, lock_nowait, ['$agent', L, read], match(ok)},
+            {1, ?LINE, locks, end_transaction, ['$agent'], match(ok)},
+            {2, ?LINE, locks, await_all_locks, ['$agent'],
+             match({have_all_locks, []})},
+            {3, ?LINE, locks, await_all_locks, ['$agent'],
+             match({have_all_locks, []})}
+           ]).
 
 lock_merge() ->
     L1 = [?MODULE, ?LINE],
