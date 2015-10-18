@@ -215,7 +215,6 @@ queue_entries_([#w{entries = Es}|Q]) ->
 queue_entries_([]) ->
     [].
 
-
 insert(ID, Agent, Client, Mode, {Locks, Tids})
   when is_list(ID), Mode==read; Mode==write ->
     Related = related_locks(ID, Locks),
@@ -363,29 +362,30 @@ do_remove_agent_([{A, ID}|T], Locks, Acc) ->
 	[] ->
 	    do_remove_agent_(T, Locks, Acc);
 	[#lock{version = V, queue = Q, watchers = Ws} = L] ->
-	    Q1 = lists:foldr(
-		   fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
-			   Acc1;
-		      (#r{entries = Es}, Acc1) ->
-                           case lists:keydelete(A, #entry.agent, Es) of
-                               [] -> Acc1;
-                               Es1 ->
-                                   [#w{entries = Es1} | Acc1]
-                           end;
-                      (#w{entries = Es}, Acc1) ->
-                           case lists:keydelete(A, #entry.agent, Es) of
-                               [] -> Acc1;
-                               Es1 ->
-                                   [#w{entries = Es1} | Acc1]
-                           end;
-		      (E, Acc1) ->
-			   [E|Acc1]
-		   end, [], Q),
-	    if Q1 == [], Ws == [] ->
-		    ets:delete(Locks, ID);
-	       true ->
-		    ok
-	    end,
+	    Q1 = trivial_lock_upgrade(
+                   lists:foldr(
+                     fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
+                             Acc1;
+                        (#r{entries = Es}, Acc1) ->
+                             case lists:keydelete(A, #entry.agent, Es) of
+                                 [] -> Acc1;
+                                 Es1 ->
+                                     [#r{entries = Es1} | Acc1]
+                             end;
+                        (#w{entries = Es}, Acc1) ->
+                             case lists:keydelete(A, #entry.agent, Es) of
+                                 [] -> Acc1;
+                                 Es1 ->
+                                     [#w{entries = Es1} | Acc1]
+                             end;
+                        (E, Acc1) ->
+                             [E|Acc1]
+                     end, [], Q)),
+            if Q1 == [], Ws == [] ->
+                    ets:delete(Locks, ID);
+               true ->
+                    ok
+            end,
 	    do_remove_agent_(T, Locks, [L#lock{version = V+1, queue = Q1,
 					       watchers = Ws -- [A]}|Acc])
     end;
@@ -394,6 +394,13 @@ do_remove_agent_([], Locks, Acc) ->
 				  watchers = Ws} = L <- Acc,
 			    Q =/= [] orelse Ws =/= []]),
     Acc.
+
+trivial_lock_upgrade([#r{entries = [#entry{agent = A}]} |
+                      [#w{entries = [#entry{agent = A}]} | _] = T]) ->
+    T;
+trivial_lock_upgrade(Q) ->
+    Q.
+
 
 related_locks(ID, T) ->
     Pats = make_patterns(ID),

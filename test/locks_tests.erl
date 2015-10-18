@@ -30,6 +30,7 @@ run_test_() ->
       [
        ?_test(simple_lock())
        , ?_test(one_lock_two_clients())
+       , ?_test(one_lock_wrr_clients())
        , ?_test(lock_merge())
        , ?_test(lock_upgrade1())
        , ?_test(lock_upgrade2())
@@ -61,7 +62,7 @@ run_test_() ->
                    ]}
           end}
       ]}
-    }.
+      }.
 
 
 simple_lock() ->
@@ -82,6 +83,23 @@ one_lock_two_clients() ->
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
+one_lock_wrr_clients() ->
+    L = [?MODULE, ?LINE],
+    script([1,2,3],
+           [
+            {1, ?LINE, locks, lock, ['$agent', L, write], match({ok,[]})},
+            {2, ?LINE, locks, lock_nowait, ['$agent', L, read], match(ok)},
+            {3, ?LINE, locks, lock_nowait, ['$agent', L, read], match(ok)},
+            {1, ?LINE, locks, end_transaction, ['$agent'], match(ok)},
+            {2, ?LINE, locks, await_all_locks, ['$agent'],
+             match({have_all_locks, []})},
+            {3, ?LINE, locks, await_all_locks, ['$agent'],
+             match({have_all_locks, []})},
+            {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {3, ?LINE, ?MODULE, kill_client, [], match(ok)}
+           ]).
+
 lock_merge() ->
     L1 = [?MODULE, ?LINE],
     L2 = L1 ++ [1],
@@ -99,15 +117,12 @@ lock_upgrade1() ->
     L2 = L1 ++ [1],
     script([1,2],
            [
-            %% {1, ?LINE, trace, true},
-            %% {2, ?LINE, trace, true},
             {1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
             {1, ?LINE, locks, lock, ['$agent', L1, write], match({ok, []})},
             {2, ?LINE, locks, lock, ['$agent', L2,read], 100,
              match(timeout, timeout)},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
-            %% {1, ?LINE, trace, false},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}
            ]).
 
@@ -115,7 +130,7 @@ lock_upgrade2() ->
     L1 = [?MODULE, ?LINE],
     L2 = L1 ++ [1],
     script([1,2],
-           [% {1, ?LINE, trace, true},
+           [
             {1, ?LINE, locks, lock, ['$agent', L1, read], match({ok, []})},
             {2, ?LINE, locks, lock, ['$agent', L2, read], match({ok,[]})},
             {1, ?LINE, locks, lock, ['$agent', L1, write], 100,
@@ -133,10 +148,10 @@ two_clients_direct_deadlock() ->
             {1, ?LINE, locks, lock, ['$agent', B], 100, match(timeout,timeout)},
             {2, ?LINE, locks, lock, ['$agent', A], 100, match(timeout,timeout)},
             {1, ?LINE, ?MODULE, client_result, [],
-             fun(normal, {ok, [_]}, St) -> St end},
+             fun(normal, {ok, [_]}, St, _) -> St end},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [],
-             fun(normal, {ok, [_]}, St) -> St end},
+             fun(normal, {ok, [_]}, St, _) -> St end},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}
            ]).
 
@@ -150,15 +165,15 @@ three_clients_deadlock() ->
        {2, ?LINE, locks, lock, ['$agent', [a]], 100, match(timeout,timeout)},
        {3, ?LINE, locks, lock, ['$agent', [b]], 100, match(timeout,timeout)},
        {1, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_|_]}, St) -> St end},
+        fun(normal, {ok, [_|_]}, St, _) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
        %% Client 2 was not involved in the lock that was surrendered,
        %% but should still be informed, as the surrendering agent knew of 2.
        {2, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_|_]}, St) -> St end},
+        fun(normal, {ok, [_|_]}, St, _) -> St end},
        {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
        {3, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_|_]}, St) -> St end},
+        fun(normal, {ok, [_|_]}, St, _) -> St end},
        {3, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_hierarchical_deadlock() ->
@@ -173,10 +188,10 @@ two_clients_hierarchical_deadlock() ->
        {1, ?LINE, locks, lock, ['$agent', B1], 100, match(timeout, timeout)},
        {2, ?LINE, locks, lock, ['$agent', A1], 100, match(timeout, timeout)},
        {1, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_|_]}, St) -> St end},
+        fun(normal, {ok, [_|_]}, St, _) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
        {2, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_|_]}, St) -> St end},
+        fun(normal, {ok, [_|_]}, St, _) -> St end},
        {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_abort_on_deadlock() ->
@@ -190,7 +205,7 @@ two_clients_abort_on_deadlock() ->
        {2, ?LINE, info, "Expect crash to follow", []},
        {2, ?LINE, locks, lock, ['$agent', A], match(error, '_')},
        {1, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, _}, St) -> St end},
+        fun(normal, {ok, _}, St, _) -> St end},
        {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
        {2, ?LINE, ?MODULE, kill_client, [], match(ok)}
        ]).
@@ -261,6 +276,7 @@ script(Agents, S) ->
     AgentPids = [spawn_agent(A) || A <- Agents],
     try eval_script(S, AgentPids)
     after
+        dbg:stop_clear(),
         [kill_client(C) || {_, C, _, _} <- AgentPids]
     end.
 
@@ -373,14 +389,25 @@ eval_script([], Agents, Acc) ->
             error({remaining, Remain})
     end.
 
-ask_agent({call, _L, M, F, A, Match} = _E, Agents) ->
+ask_agent({call, L, M, F, A, Match} = _E, Agents) ->
     io:fwrite(user, "ask_agent(~p)~n", [_E]),
     {C, Res} = try {normal, apply(M, F, A)}
                catch
                    error:E -> {error, E}
                end,
     io:fwrite(user, "~p -> ~p:~p~n", [_E, C, Res]),
-    _ = Match(C, Res, undefined),
+    _ = Match(C, Res, undefined, L),
+    {ok, Agents};
+ask_agent({trace_locks_server, _L, Bool}, Agents) ->
+    if Bool ->
+            io:fwrite(user,
+                      "Trace on locks_server:~n~p~n",
+                      [[dbg:tracer(),
+                        dbg:tpl(locks_server, x),
+                        dbg:p(locks_server, [c,m])]]);
+       true ->
+            dbg:ctpl(locks_server)
+    end,
     {ok, Agents};
 ask_agent({A, _L, trace, Bool}, Agents) ->
     {_, Pid, APid, _} = lists:keyfind(A, 1, Agents),
@@ -392,8 +419,7 @@ ask_agent({A, _L, trace, Bool}, Agents) ->
                            dbg:p(Pid, [c,m]),
                            dbg:p(APid, [c,m])]]);
        true ->
-            dbg:ctpl(locks_agent),
-            dbg:stop()
+            dbg:ctpl(locks_agent)
     end,
     {ok, Agents};
 ask_agent({A, _L, info, Fmt, Args}, Agents) ->
@@ -402,12 +428,12 @@ ask_agent({A, _L, info, Fmt, Args}, Agents) ->
     {ok, Agents};
 ask_agent({A, L, M, F, Args, Match}, Agents) ->
     ask_agent({A, L, M, F, Args, infinity, Match}, Agents);
-ask_agent({A, _, M, F, Args, Timeout, Match} = _E, Agents) ->
+ask_agent({A, L, M, F, Args, Timeout, Match} = _E, Agents) ->
     io:fwrite(user, "ask_agent(~p)~n", [_E]),
     {_, Pid, APid, St} = lists:keyfind(A, 1, Agents),
     {C, Res} = ask_client(Pid, M, F, subst(Args, Agents), Timeout),
     io:fwrite(user, "~p -> ~p:~p~n", [_E, C, Res]),
-    St1 = Match(C, Res, St),
+    St1 = Match(C, Res, St, L),
     {Res, lists:keyreplace(A, 1, Agents, {A, Pid, APid, St1})}.
 
 repl_agent(Pid, Args) ->
@@ -428,16 +454,26 @@ match(Const) ->
 
 match(Catch, Const) ->
     if Const == '_' ->
-            fun(Ca, _, St) when Ca == Catch ->
+            fun(Ca, _, St, _) when Ca == Catch ->
                     St;
-               (C, Res, St) ->
-                    error({mismatch, [C, Res, Catch, St]})
+               (C, Res, St, L) ->
+                    error({mismatch,
+                           [{line, L},
+                            {pattern, '_'},
+                            {result, Res},
+                            {state, St}]
+                           ++ [{caught, C} || C =/= normal]})
             end;
        true ->
-            fun(Ca, Co, St) when Ca == Catch, Co == Const ->
+            fun(Ca, Co, St, _) when Ca == Catch, Co == Const ->
                     St;
-               (Ca, Co, St) ->
-                    error({mismatch, [Ca, Co, Catch, St]})
+               (Ca, Co, St, L) ->
+                    error({mismatch,
+                           [{line, L},
+                            {pattern, Const},
+                            {result, Co},
+                            {state, St}]
+                           ++ [{caught, Ca} || Ca =/= normal]})
             end
     end.
 
