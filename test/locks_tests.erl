@@ -34,6 +34,7 @@ run_test_() ->
        , ?_test(lock_merge())
        , ?_test(lock_upgrade1())
        , ?_test(lock_upgrade2())
+       , ?_test(lock_upgrade3())
        , ?_test(two_clients_direct_deadlock())
        , ?_test(three_clients_deadlock())
        , ?_test(two_clients_hierarchical_deadlock())
@@ -138,6 +139,22 @@ lock_upgrade2() ->
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {1, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+lock_upgrade3() ->
+    L = [?MODULE, ?LINE],
+    Match = fun(normal, {ok,_}, St, _) -> St;
+               (timeout, timeout, St, _) -> St
+            end,
+    script([1,2],
+           [
+            {1, ?LINE, locks, lock, ['$agent', L, read], match({ok,[]})},
+            {2, ?LINE, locks, lock, ['$agent', L, read], match({ok,[]})},
+            {1, ?LINE, locks, lock, ['$agent', L, write], 100, Match},
+            {2, ?LINE, locks, lock, ['$agent', L, write], 100, Match},
+            {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {2, ?LINE, locks, await_all_locks, ['$agent'],
+             fun(normal, {ok, _}, St, _) -> St end},
+            {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
 
 two_clients_direct_deadlock() ->
     A = [?MODULE, ?LINE],

@@ -322,11 +322,11 @@ move_to_last([#r{entries = Es} = R | T], A, V) ->
 append_read_entry([#r{entries = Es} = R], E) ->
     [R#r{entries = [E|Es]}];
 append_read_entry([#w{} = W], E) ->
-    [W, E];
+    [W, #r{entries = [E]}];
 append_read_entry([H|T], E) ->
     [H | append_read_entry(T, E)];
 append_read_entry([], E) ->
-    [E].
+    [#r{entries = [E]}].
 
 
 do_remove_agent(A, {Locks, Agents}) ->
