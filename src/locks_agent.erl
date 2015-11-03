@@ -111,8 +111,8 @@
           client           :: pid(),
           client_mref      :: reference(),
           options = []     :: [option()],
-          notify = []      :: [{pid(), reference(), await_all_locks}
-                               | {pid(), events}],
+          notify = []      :: [pid()],
+          awaiting_all = []:: [{pid(), reference()}],
           answer           :: locking | waiting | done,
           deadlocks = []   :: deadlocks(),
           have_all = false :: boolean(),
@@ -477,7 +477,7 @@ init(Opts) ->
     Client = proplists:get_value(client, Opts),
     ClientMRef = erlang:monitor(process, Client),
     Notify = case proplists:get_value(notify, Opts, false) of
-                 true -> [{Client, events}];
+                 true -> [Client];
                  false -> []
              end,
     AwaitNodes = proplists:get_value(await_nodes, Opts, false),
@@ -505,8 +505,15 @@ handle_call(lock_info, _From, #state{locks = Locks,
     {reply, {ets:tab2list(Pending), ets:tab2list(Locks)}, State};
 handle_call(transaction_status, _From, #state{status = Status} = State) ->
     {reply, Status, State};
-handle_call(await_all_locks, {Client, Tag}, State) ->
-    {noreply, check_if_done(add_waiter(wait, Client, Tag, State))};
+handle_call(await_all_locks, {Client, Tag},
+            #state{status = Status, awaiting_all = Aw} = State) ->
+    case Status of
+        {have_all_locks, _} ->
+            {noreply, notify_have_all(
+                        State#state{awaiting_all = [{Client, Tag}|Aw]})};
+        _ ->
+            {noreply, check_if_done(add_waiter(wait, Client, Tag, State))}
+    end;
 handle_call({monitor_nodes, Bool}, _From, St) when is_boolean(Bool) ->
     {reply, St#state.monitor_nodes, St#state{monitor_nodes = Bool}};
 handle_call(stop, {Client, _}, State) when Client==?myclient ->
@@ -551,7 +558,6 @@ handle_cast({option, O, Val}, #state{notify = Notify,
              await_nodes ->
                  S#state{await_nodes = Val};
              notify ->
-                 Entry = {C, events},
                  case Val of
                      true ->
                          S1a = case Notify of
@@ -562,9 +568,9 @@ handle_cast({option, O, Val}, #state{notify = Notify,
                               end,
                          %% always send an initial status notification
                          C ! {?MODULE, self(), S1a#state.status},
-                         S1a#state{notify = list_store(Entry, Notify)};
+                         S1a#state{notify = list_store(C, Notify)};
                      false ->
-                         S#state{notify = S#state.notify -- [Entry]}
+                         S#state{notify = S#state.notify -- [C]}
                  end;
              _ ->
                  S#state{options = lists:keystore(O, 1, Opts, {O, Val})}
@@ -746,8 +752,8 @@ handle_info(_Msg, S) ->
 
 add_waiter(nowait, _, _, State) ->
     State;
-add_waiter(wait, Client, Tag, #state{notify = Notify} = State) ->
-    State#state{notify = [{Client, Tag, await_all_locks}|Notify]}.
+add_waiter(wait, Client, Tag, #state{awaiting_all = Aw} = State) ->
+    State#state{awaiting_all = [{Client, Tag} | Aw]}.
 
 %% maybe_reply(nowait, _, _, State) ->
 %%     {noreply, State};
@@ -927,14 +933,20 @@ request_surrender({OID, Node} = _LockID, #state{}) ->
 check_if_done(S) ->
     check_if_done(S, []).
 
-check_if_done(#state{notify = []} = S, _) ->
-    S;
 check_if_done(#state{} = State, Msgs) ->
     Status = all_locks_status(State),
     notify_msgs(Msgs, set_status(Status, State)).
 
-have_all(#state{claim_no = Cl} = State) ->
-    State#state{have_all = true, claim_no = Cl + 1}.
+have_all(#state{have_all = Prev, claim_no = Cl} = State) ->
+    Cl1 = case Prev of
+              true -> Cl;
+              false -> Cl + 1
+          end,
+    notify_have_all(State#state{have_all = true, claim_no = Cl1}).
+
+notify_have_all(#state{awaiting_all = Aw, status = Status} = S) ->
+    [gen_server:reply(W, Status) || W <- Aw],
+    S#state{awaiting_all = []}.
 
 abort_on_deadlock(OID, State) ->
     notify({abort, Reason = {deadlock, OID}}, State),
@@ -948,18 +960,8 @@ notify_msgs([], S) ->
 
 
 notify(Msg, #state{notify = Notify} = State) ->
-    NewNotify =
-        lists:filter(
-          fun({P, events}) ->
-                  P ! {?MODULE, self(), Msg},
-                  true;
-             ({P, R, await_all_locks}) when element(1,Msg) == have_all_locks ->
-                  gen_server:reply({P, R}, Msg),
-                  false;
-             (_) ->
-                  true
-          end, Notify),
-    State#state{notify = NewNotify}.
+    [P ! {?MODULE, self(), Msg} || P <- Notify],
+    State.
 
 handle_locks(#state{have_all = true} = State) ->
     %% If we have all locks we've asked for, no need to search for potential
@@ -1084,9 +1086,9 @@ lock_holder([#r{entries = Es}|_]) ->
 
 
 all_locks_status_(#state{locks = Locks, pending = Pend} = State) ->
-    case ets:info(Locks, size) of
+    case ets_info(Locks, size) of
         0 ->
-            case ets:info(Pend, size) of
+            case ets_info(Pend, size) of
                 0 -> no_locks;
                 _ ->
                     waiting
@@ -1274,6 +1276,7 @@ ets_delete_object(T, O) -> ets:delete_object(T, O).
 ets_match_delete(T, P)  -> ets:match_delete(T, P).
 ets_select(T, P)        -> ets:select(T, P).
 ets_next(T, K)          -> ets:next(T, K).
+ets_info(T, I)          -> ets:info(T, I).
 %% ets_select(T, P, L)     -> ets:select(T, P, L).
 
 

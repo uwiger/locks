@@ -322,11 +322,11 @@ move_to_last([#r{entries = Es} = R | T], A, V) ->
 append_read_entry([#r{entries = Es} = R], E) ->
     [R#r{entries = [E|Es]}];
 append_read_entry([#w{} = W], E) ->
-    [W, E];
+    [W, #r{entries = [E]}];
 append_read_entry([H|T], E) ->
     [H | append_read_entry(T, E)];
 append_read_entry([], E) ->
-    [E].
+    [#r{entries = [E]}].
 
 
 do_remove_agent(A, {Locks, Agents}) ->
@@ -398,6 +398,17 @@ do_remove_agent_([], Locks, Acc) ->
 trivial_lock_upgrade([#r{entries = [#entry{agent = A}]} |
                       [#w{entries = [#entry{agent = A}]} | _] = T]) ->
     T;
+trivial_lock_upgrade([#r{entries = Es}|[_|_] = T] = Q) ->
+    %% Not so trivial, perhaps
+    case lists:all(fun(#entry{agent = A}) ->
+                           in_queue(T, A, write)
+                   end, Es) of
+        true ->
+            %% All agents holding the read lock are also waiting for an upgrade
+            trivial_lock_upgrade(T);
+        false ->
+            Q
+    end;
 trivial_lock_upgrade(Q) ->
     Q.
 
@@ -527,6 +538,18 @@ into_queue(Type, [H|T], #entry{agent = A, type = direct} = Entry) ->
             maybe_refresh(Es, H, T, Type, A, Entry);
         #r{entries = Es} when Type == read ->
             maybe_refresh(Es, H, T, Type, A, Entry);
+        #r{entries = Es} when Type == write ->
+            %% A special case is when all agents holding read entries have
+            %% asked for an upgrade.
+            case lists:all(fun(#entry{agent = A1}) when A1 == A -> true;
+                              (#entry{agent = A1}) -> in_queue(T, A1, write)
+                           end, Es) of
+                true ->
+                    %% discard all read entries
+                    into_queue(write, T, Entry);
+                false ->
+                    [H | into_queue(Type, T, Entry)]
+            end;
         _ ->
             [H | into_queue(Type, T, Entry)]
     end;
