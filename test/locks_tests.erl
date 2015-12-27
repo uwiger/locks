@@ -35,6 +35,8 @@ run_test_() ->
        , ?_test(lock_upgrade1())
        , ?_test(lock_upgrade2())
        , ?_test(lock_upgrade3())
+       , ?_test(two_w_locks_parent_read())
+       , ?_test(two_w_locks_parent_read_deadlock())
        , ?_test(two_clients_direct_deadlock())
        , ?_test(three_clients_deadlock())
        , ?_test(two_clients_hierarchical_deadlock())
@@ -162,6 +164,40 @@ lock_upgrade3() ->
             {2, ?LINE, locks, await_all_locks, ['$agent'],
              fun(normal, {have_all_locks, _}) -> ok end},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+two_w_locks_parent_read() ->
+    L0 = [?MODULE, ?LINE],
+    L1 = L0 ++ [1],
+    L2 = L0 ++ [2],
+    script(
+      [1,2],
+      [
+       {1,?LINE, locks,lock, ['$agent',L1,write], match({ok,[]})},
+       {2,?LINE, locks,lock, ['$agent',L2,write], match({ok,[]})},
+       {1,?LINE, locks,lock, ['$agent',L0,read], 100, match(timeout,timeout)},
+       {2,?LINE, ?MODULE, kill_client, [], match(ok)},
+       {1,?LINE, ?MODULE, client_result, [], match({ok,[]})},
+       {1,?LINE, ?MODULE, kill_client, [], match(ok)}
+      ]).
+
+two_w_locks_parent_read_deadlock() ->
+    L0 = [?MODULE, ?LINE],
+    L1 = L0 ++ [1],
+    L2 = L0 ++ [2],
+    script(
+      [1,2],
+      [
+       {1,?LINE, locks,lock, ['$agent',L1,write], match({ok,[]})},
+       {2,?LINE, locks,lock, ['$agent',L2,write], match({ok,[]})},
+       {1,?LINE, locks,lock, ['$agent',L0,read], 100, match(timeout,timeout)},
+       {2,?LINE, locks,lock, ['$agent',L0,read], 100, match(timeout,timeout)},
+       {1, ?LINE, ?MODULE, client_result, [],
+        fun(normal, {ok, [_,_,_]}) -> ok end},
+       {1,?LINE, ?MODULE, kill_client, [], match(ok)},
+       {2, ?LINE, ?MODULE, client_result, [],
+        fun(normal, {ok, [_,_,_]}) -> ok end},
+       {2,?LINE, ?MODULE, kill_client, [], match(ok)}
+      ]).
 
 two_clients_direct_deadlock() ->
     A = [?MODULE, ?LINE],
