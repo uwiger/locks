@@ -43,12 +43,16 @@
 
 -record(st, {tabs = {ets:new(?LOCKS, [public, named_table,
                                       ordered_set, {keypos, 2}]),
-		     ets:new(?AGENTS, [public, named_table, bag])},
+		     ets:new(?AGENTS, [public, named_table, ordered_set])},
 	     monitors = dict:new(),
 	     notify_as = self()}).
 
+-record(surr, {id, mode, type, client, vsn, lock}).
+
 record_fields(st) ->
     record_info(fields, st);
+record_fields(surr) ->
+    record_info(fields, surr);
 record_fields(_) ->
     no.
 
@@ -70,7 +74,7 @@ agents(LockID) ->
                     end, [], LockID).
 
 watchers(LockID) ->
-    case ets:lookup(?LOCKS, LockID) of
+    case ets_lookup(?LOCKS, LockID) of
         [#lock{watchers = Ws}] ->
             Ws;
         [] ->
@@ -221,13 +225,13 @@ insert(ID, Agent, Client, Mode, {Locks, Tids})
     NewVsn = new_vsn(Related),
     {Check, Result} = insert_agent(Related, ID, Agent, Client, Mode, NewVsn),
     ?event({insert_agent, ID, Agent, {Check, Result}}),
-    ets:insert(Tids, [{Agent,ID1} || #lock{object = ID1} <- Result]),
+    ets_insert(Tids, [{{Agent,ID1}} || #lock{object = ID1} <- Result]),
     check_tids(Check, ID, Agent, Result, Tids),
-    ets:insert(Locks, Result),
+    ets_insert(Locks, Result),
     Result.
 
 insert_watcher(ID, Pid, {Locks, Tids}) ->
-    case ets:lookup(Locks, ID) of
+    case ets_lookup(Locks, ID) of
 	[#lock{queue = Q, watchers = Ws} = L] ->
 	    L1 = L#lock{watchers = [Pid | Ws -- [Pid]]},
 	    if Q == [] -> ok;
@@ -235,17 +239,17 @@ insert_watcher(ID, Pid, {Locks, Tids}) ->
                     %% send first notification if lock held
                     Pid ! #locks_info{lock = ID}
 	    end,
-	    ets:insert(Locks, L1);
+	    ets_insert(Locks, L1);
 	[] ->
-	    ets:insert(Locks, #lock{object = ID, watchers = [Pid]})
+	    ets_insert(Locks, #lock{object = ID, watchers = [Pid]})
     end,
-    ets:insert(Tids, {Pid, ID}).
+    ets_insert(Tids, {{Pid, ID}}).
 
 delete_watcher(ID, Pid, {Locks, Tids}) ->
-    case ets:lookup(Locks, ID) of
+    case ets_lookup(Locks, ID) of
 	[#lock{watchers = Ws} = L] ->
-	    ets:insert(Locks, L#lock{watchers = Ws -- [Pid]}),
-	    ets:delete_object(Tids, {Pid, ID});
+	    ets_insert(Locks, L#lock{watchers = Ws -- [Pid]}),
+	    ets_delete(Tids, {Pid, ID});
 	[] ->
 	    ok
     end.
@@ -254,7 +258,7 @@ check_tids(false, _, _, _, _) ->
     false;
 check_tids(true, ID, Agent, Result, Tids) ->
     #lock{queue = Q} = lists:keyfind(ID, #lock.object, Result),
-    ets:insert(Tids, [{A, ID} ||
+    ets_insert(Tids, [{{A, ID}} ||
                          #entry{agent = A, type = Type} <- flatten_queue(Q),
                          A =/= Agent orelse Type == indirect]).
 
@@ -273,7 +277,7 @@ flatten_queue([], Acc) ->
 %% Fold over the queue of LockID, if such a lock exists; otherwise -> [].
 %% Order is not guaranteed to represent wait order.
 fold_lock_queue(F, Acc, LockID) ->
-    case ets:lookup(?LOCKS, LockID) of
+    case ets_lookup(?LOCKS, LockID) of
         [] ->
             [];
         [#lock{queue = Q}] ->
@@ -287,56 +291,126 @@ fold_queue(F, Acc, [#w{entries = Es}|Q]) ->
 fold_queue(_, Acc, []) ->
     Acc.
 
+%% Idea:
+%% We must find the responsible direct lock and surrender it, as well as
+%% all indirect locks that are a consequence of the direct lock
+%% If one or more of the indirect locks could be a consequence of another
+%% of our direct locks in the found set, also release that lock and all its
+%% indirect locks. Then reapply the direct locks (they will end up last in
+%% line, and relevant indirect locks will also be reapplied as a result.)
+%% 1. Find related locks (parents and children); extend the found set if
+%%    a parent lock entry for A is an indirect lock: then also include any
+%%    other children, referenced by A, of that parent.
+%% 2. Split into direct and indirect locks.
+%% 3. Group direct locks with indirect locks that would be a result
+%%    Each direct lock forms a group, represented as a list,
+%%    [ DirectLock | IndirectLocks ].
+%% 4. Select all groups that have the ID to surrender anywhere in the list
+%%    (either as a direct or indirect lock).
+%% 5. Remove agent A from all locks in the found groups.
+%% 6. Re-apply the direct locks.
+%% 7. Increment versions of updated locks.
+do_surrender(ID, A, {Locks, Agents}) ->
+    Related = related_locks(ID, A, Agents, Locks),
+    Groups = group_related(Related, A),
+    AffectedGroups = affected_groups(Groups, ID),  % list of lists
+    Reapply = [hd(G) || G <- AffectedGroups],
+    AllLocks = lists:ukeysort(#surr.id, lists:append(AffectedGroups)),
+    AllLocks1 =
+        [remove_agent_from_lock(A, S#surr.lock) || S <- AllLocks],
+    {Check, Updated} =
+        lists:foldl(
+          fun(#surr{id = L, mode = Mode,
+                    client = Client,
+                    lock = #lock{version = V}}, {Chk, Acc}) ->
+                  {Check, Upd} =
+                      insert_agent(Acc, L, A, Client, Mode, V),
+                  {Check orelse Chk,
+                   lists:foldl(fun(Lock, Acc2) ->
+                                       lists:keyreplace(
+                                         Lock#lock.object,
+                                         #lock.object, Acc2, Lock)
+                               end, Acc, Upd)}
+          end, {false, AllLocks1}, Reapply),
+    check_tids(Check, ID, A, Updated, Agents),
+    _Updated1 = process_updated(Updated, A, Locks, Agents).
 
-do_surrender(ID, Tid, {Locks, _Tids}) ->
-    Related = related_locks(ID, Locks),
-    Surrender = [L || L <- Related,
-		      has_lock(L#lock.queue, Tid)],
-    Updated =
-	lists:map(
-	  fun(#lock{queue = Q, version = V} = L) ->
-		  V1 = V+1,
-		  Q1 = move_to_last(Q, Tid, V),
-		  L#lock{version = V1, queue = Q1}
-	  end, Surrender),
-    ets:insert(Locks, Updated),
-    Updated.
+group_related(Locks, A) ->
+    {Direct, Indirect} = split_direct_indirect(Locks, A),
+    group_indirects(Direct, Indirect).
 
-has_lock([#w{entries = [#entry{agent = A1}]}|_], A) ->
-    A1 =:= A;
-has_lock([#r{entries = Es}|_], A) ->
-    lists:keymember(A, #entry.agent, Es);
-has_lock(_, _) ->
-    false.
+split_direct_indirect(Locks, A) ->
+    split_direct_indirect(Locks, A, [], []).
 
+split_direct_indirect([#lock{queue = Q} = H|T], A, D, I) ->
+    case find_first_entry(Q, A) of
+        {Mode, #entry{type = direct, version = V, client = Client}} ->
+            split_direct_indirect(T, A, [#surr{id = H#lock.object,
+                                               mode = Mode,
+                                               type = direct,
+                                               client = Client,
+                                               vsn = V,
+                                               lock = H}|D], I);
+        {Mode, #entry{type = indirect, version = V, client = Client}} ->
+            split_direct_indirect(T, A, D, [#surr{id = H#lock.object,
+                                                  mode = Mode,
+                                                  type = indirect,
+                                                  client = Client,
+                                                  vsn = V,
+                                                  lock = H}|I])
+    end;
+split_direct_indirect([], _, D, I) ->
+    {lists:reverse(D), lists:reverse(I)}.
 
-move_to_last([#w{entries = [#entry{agent = A} = E]}|T], A, V) ->
-    T ++ [#w{entries = [E#entry{version = V}]}];
-move_to_last([#r{entries = [#entry{agent = A} = E]}|T], A, V) ->
-    append_read_entry(T, E#entry{version = V});
-move_to_last([#r{entries = Es} = R | T], A, V) ->
-    #entry{} = E = lists:keyfind(A, #entry.agent, Es),
-    append_read_entry([R#r{entries = lists:keydelete(A, #entry.agent, Es)}|T],
-		      E#entry{version = V}).
+find_first_entry([H|T], A) ->
+    {Mode, Entries} = case H of
+                          #w{entries = Es} -> {write, Es};
+                          #r{entries = Es} -> {read, Es}
+                      end,
+    case lists:keyfind(A, #entry.agent, Entries) of
+        #entry{} = E ->
+            {Mode, E};
+        false ->
+            find_first_entry(T, A)
+    end.
 
-append_read_entry([#r{entries = Es} = R], E) ->
-    [R#r{entries = [E|Es]}];
-append_read_entry([#w{} = W], E) ->
-    [W, #r{entries = [E]}];
-append_read_entry([H|T], E) ->
-    [H | append_read_entry(T, E)];
-append_read_entry([], E) ->
-    [#r{entries = [E]}].
+group_indirects(Direct, Indirect) ->
+    [[S | lists:filter(fun(#surr{id = Id1}) ->
+                               lists:prefix(S#surr.id, Id1)
+                                   orelse
+                                   lists:prefix(Id1, S#surr.id)
+                       end, Indirect)]
+     || S <- Direct].
 
+affected_groups(Groups, ID) ->
+    [G || G <- Groups,
+          lists:keymember(ID, #surr.id, G)].
+
+process_updated([#lock{object = ID,
+                       queue = [],
+                       watchers = Ws,
+                       version = V} = H|T], A, Locks, Agents) ->
+    ets_delete(Agents, {A, ID}),
+    if Ws =:= [] ->
+            ets_delete(Locks, ID),
+            process_updated(T, A, Locks, Agents);
+       true ->
+            H1 = H#lock{version = V+1},
+            ets_insert(Locks, H1),
+            [H1 | process_updated(T, A, Locks, Agents)]
+    end;
+process_updated([#lock{version = V} = H|T], A, Locks, Agents) ->
+    H1 = H#lock{version = V+1},
+    ets_insert(Locks, H1),
+    [H1 | process_updated(T, A, Locks, Agents)];
+process_updated([], _, _, _) ->
+    [].
 
 do_remove_agent(A, {Locks, Agents}) ->
-    case ets:lookup(Agents, A) of
-	[] -> [];
-	Found ->
-            ?event([{removing_agent, A}, {found, Found}]),
-	    ets:delete(Agents, A),
-	    do_remove_agent_(Found, Locks, [])
-    end.
+    Found = ets_select(Agents, [{ {{A,'$1'}}, [], [{{A,'$1'}}] }]),
+    ?event([{removing_agent, A}, {found, Found}]),
+    ets:select_delete(Agents, [{ {{A,'_'}}, [], [true] }]),
+    do_remove_agent_(Found, Locks, []).
 
 monitor_agent(A, #st{monitors = Mons} = S) when is_pid(A) ->
     case dict:find(A, Mons) of
@@ -358,42 +432,46 @@ demonitor_agent(A, #st{monitors = Mons} = S) when is_pid(A) ->
 
 
 do_remove_agent_([{A, ID}|T], Locks, Acc) ->
-    case ets:lookup(Locks, ID) of
+    case ets_lookup(Locks, ID) of
 	[] ->
 	    do_remove_agent_(T, Locks, Acc);
-	[#lock{version = V, queue = Q, watchers = Ws} = L] ->
-	    Q1 = trivial_lock_upgrade(
-                   lists:foldr(
-                     fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
-                             Acc1;
-                        (#r{entries = Es}, Acc1) ->
-                             case lists:keydelete(A, #entry.agent, Es) of
-                                 [] -> Acc1;
-                                 Es1 ->
-                                     [#r{entries = Es1} | Acc1]
-                             end;
-                        (#w{entries = Es}, Acc1) ->
-                             case lists:keydelete(A, #entry.agent, Es) of
-                                 [] -> Acc1;
-                                 Es1 ->
-                                     [#w{entries = Es1} | Acc1]
-                             end;
-                        (E, Acc1) ->
-                             [E|Acc1]
-                     end, [], Q)),
-            if Q1 == [], Ws == [] ->
-                    ets:delete(Locks, ID);
-               true ->
-                    ok
-            end,
-	    do_remove_agent_(T, Locks, [L#lock{version = V+1, queue = Q1,
-					       watchers = Ws -- [A]}|Acc])
+	[#lock{} = L] ->
+            case remove_agent_from_lock(A, L) of
+                #lock{queue = [], watchers = []} ->
+                    ets_delete(Locks, ID),
+                    do_remove_agent_(T, Locks, Acc);
+                #lock{} = L1 ->
+                    do_remove_agent_(T, Locks, [L1|Acc])
+            end
     end;
 do_remove_agent_([], Locks, Acc) ->
-    ets:insert(Locks, [L || #lock{queue = Q,
+    ets_insert(Locks, [L || #lock{queue = Q,
 				  watchers = Ws} = L <- Acc,
 			    Q =/= [] orelse Ws =/= []]),
     Acc.
+
+remove_agent_from_lock(A, #lock{version = V, queue = Q, watchers = Ws} = L) ->
+    Q1 = trivial_lock_upgrade(
+           lists:foldr(
+             fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
+                     Acc1;
+                (#r{entries = Es}, Acc1) ->
+                     case lists:keydelete(A, #entry.agent, Es) of
+                         [] -> Acc1;
+                         Es1 ->
+                             [#r{entries = Es1} | Acc1]
+                     end;
+                (#w{entries = Es}, Acc1) ->
+                     case lists:keydelete(A, #entry.agent, Es) of
+                         [] -> Acc1;
+                         Es1 ->
+                             [#w{entries = Es1} | Acc1]
+                     end;
+                (E, Acc1) ->
+                     [E|Acc1]
+             end, [], Q)),
+    L#lock{version = V+1, queue = Q1,
+           watchers = Ws -- [A]}.
 
 trivial_lock_upgrade([#r{entries = [#entry{agent = A}]} |
                       [#w{entries = [#entry{agent = A}]} | _] = T]) ->
@@ -412,10 +490,46 @@ trivial_lock_upgrade([#r{entries = Es}|[_|_] = T] = Q) ->
 trivial_lock_upgrade(Q) ->
     Q.
 
+related_locks(ID, A, Agents, Locks) ->
+    Pats = agent_patterns(ID, A, []),
+    IDs = ets_select(Agents, Pats),
+    get_locks(IDs, A, ID, IDs, Agents, Locks).
+
+get_locks([ID|T], _A, ID, _Vis, _Agents, Locks) ->
+    %% All following should be children of ID
+    [get_lock(Locks, ID) | [get_lock(Locks, L) || L <- T]];
+get_locks([H|T], A, ID, Vis, Agents, Locks) ->
+    #lock{queue = Q} = L = get_lock(Locks, H),
+    case find_first_entry(Q, A) of
+        #entry{type = indirect} ->
+            %% Must include possible direct-lock children that were not
+            %% in the original set (since they intersect in indirect-lock
+            %% parents). Don't fetch any lock twice.
+            Pat = [{ {{A, H ++ '_'}}, [], [{element,2,{element,1,'$_'}}]}],
+            Extra = [I || I <- ets_select(Agents, Pat),
+                          not lists:member(I, Vis)],
+            [L | [get_lock(Locks, X) || X <- Extra]]
+                ++ get_locks(T, A, ID, Extra ++ Vis, Agents, Locks);
+        _ ->
+            [L|get_locks(T, A, ID, Vis, Agents, Locks)]
+    end;
+get_locks([], _, _, _, _, _) ->
+    [].
+
+agent_patterns([H|T], Tid, Acc) ->
+    Id = Acc ++ [H],
+    [{ {{Tid, Id}}, [], [{element, 2, {element, 1, '$_'}}] }
+     | agent_patterns(T, Tid, Id)];
+agent_patterns([], Tid, Acc) ->
+    [{ {{Tid, Acc ++ '_'}}, [], [{element, 2, {element, 1, '$_'}}] }].
+
+get_lock(T, Id) ->
+    [L] = ets_lookup(T, Id),
+    L.
 
 related_locks(ID, T) ->
     Pats = make_patterns(ID),
-    ets:select(T, Pats).
+    ets_select(T, Pats).
 
 make_patterns(ID) ->
     make_patterns(ID, []).
@@ -531,6 +645,11 @@ into_queue(write, [#w{entries = [#entry{agent = A}]}],
     [#w{entries = [Entry]}];
 into_queue(Type, [H|T], #entry{agent = A, type = direct} = Entry) ->
     case H of
+        #w{entries = [_,_|_]} ->
+            %% This means that there are multiple exclusive write locks at
+            %% a lower level; they can co-exist, but neither has an exclusive
+            %% claim at this level. Queue request
+            [H | into_queue(Type, T, Entry)];
         #w{entries = Es} when Type == write; Type == read ->
             %% If a matching entry exists, we set to new version and
             %% set type to direct. This means we might get a direct write
@@ -593,14 +712,6 @@ update_parents([#lock{queue = Q} = H|T], Entry, Mode, Vsn, Acc) ->
     if T == [] -> {lists:reverse(Acc1), [set_indirect(E) || E <- Q]};
        true    -> update_parents(T, Entry, Mode, Vsn, Acc1)
     end.
-
-%% set_indirect([#r{entries = Entries} = H|T]) ->
-%%     [H#r{entries = [E#entry{type = indirect} || E <- Entries]}
-%%      | set_indirect(T)];
-%% set_indirect([#w{entry = E} = H|T]) ->
-%%     [H#w{entry = E#entry{type = indirect}} | set_indirect(T)];
-%% set_indirect([]) ->
-%%     [].
 
 update_children(Children, Entry, Mode, Vsn) ->
     update_children(Children, Entry, Mode, Vsn, [], []).
@@ -749,6 +860,11 @@ split4(Ch, Ps, _ID) -> {Ps, [], Ch}.
 
 event(_Line, _Msg, _St) ->
     ok.
+
+ets_insert(T, Data) -> ets:insert(T, Data).
+ets_lookup(T, K)    -> ets:lookup(T, K).
+ets_select(T, Pat)  -> ets:select(T, Pat).
+ets_delete(T, K)    -> ets:delete(T, K).
 
 %% ===================================================================
 

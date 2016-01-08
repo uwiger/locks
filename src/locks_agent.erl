@@ -71,6 +71,12 @@
 
 -include("locks.hrl").
 
+-define(costly_event(E),
+        case erlang:trace_info({?MODULE,event,3}, traced) of
+            {_, false} -> ok;
+            _          -> event(?LINE, E, none)
+        end).
+
 -define(event(E), event(?LINE, E, none)).
 -define(event(E, S), event(?LINE, E, S)).
 
@@ -755,32 +761,6 @@ add_waiter(nowait, _, _, State) ->
 add_waiter(wait, Client, Tag, #state{awaiting_all = Aw} = State) ->
     State#state{awaiting_all = [{Client, Tag} | Aw]}.
 
-%% maybe_reply(nowait, _, _, State) ->
-%%     {noreply, State};
-%% maybe_reply(wait, Client, Tag, State) ->
-%%     await_all_locks_(Client, Tag, State).
-
-%% await_all_locks_(Client, Tag, State) ->
-%%     Status = all_locks_status(State),
-%%     ?event({all_locks_status, Status}),
-%%     State1 = set_status(Status, State),
-%%     case Status of
-%%         no_locks ->
-%%             gen_server:reply({Client, Tag}, {error, no_locks}),
-%% 	    {noreply, State1};
-%%         {have_all_locks, Deadlocks} ->
-%%             Msg = {have_all_locks, Deadlocks},
-%%             gen_server:reply({Client, Tag}, Msg),
-%%             {noreply, notify(Msg, State1)};
-%%         waiting ->
-%%             Entry = {Client, Tag, await_all_locks},
-%%             {noreply, State1#state{notify = [Entry|State#state.notify]}};
-%%         {cannot_serve, Objs} ->
-%%             Reason = {could_not_lock_objects, Objs},
-%%             gen_server:reply({Client, Tag}, Reason),
-%%             {stop, {error, Reason}, State1}
-%%     end.
-
 set_status(Status, #state{status = Status} = S) ->
     S;
 set_status({have_all_locks, _} = Status, S) ->
@@ -1001,9 +981,10 @@ do_surrender(ShouldSurrender, ToObject, InvolvedAgents,
     OldLock = get_lock(ToObject, State),
     State1 = delete_lock(OldLock, State),
     NewDeadlocks = [{ShouldSurrender, ToObject} | Deadlocks],
-    ?event({do_surrender, [{should_surrender, ShouldSurrender},
-                           {to_object, ToObject},
-                           {involved_agents, lists:sort(InvolvedAgents)}]}),
+    ?costly_event({do_surrender,
+                   [{should_surrender, ShouldSurrender},
+                    {to_object, ToObject},
+                    {involved_agents, lists:sort(InvolvedAgents)}]}),
     if ShouldSurrender == self() ->
             request_surrender(ToObject, State1),
             send_surrender_info(InvolvedAgents, OldLock),
@@ -1065,9 +1046,9 @@ code_change(_FromVsn, State, _Extra) ->
 %%
 all_locks_status(#state{pending = Pend, locks = Locks} = State) ->
     Status = all_locks_status_(State),
-    ?event({locks_diagnostics,
-            [{pending, pp_pend(ets:tab2list(Pend))},
-             {locks, pp_locks(ets:tab2list(Locks))}]}),
+    ?costly_event({locks_diagnostics,
+                   [{pending, pp_pend(ets:tab2list(Pend))},
+                    {locks, pp_locks(ets:tab2list(Locks))}]}),
     ?event({all_locks_status, Status}),
     Status.
 
@@ -1079,8 +1060,8 @@ pp_locks(Locks) ->
     [{O,lock_holder(Q)} ||
         #lock{object = O, queue = Q} <- Locks].
 
-lock_holder([#w{entries = [#entry{agent = A}]}|_]) ->
-    A;
+lock_holder([#w{entries = Es}|_]) ->
+    [A || #entry{agent = A} <- Es];
 lock_holder([#r{entries = Es}|_]) ->
     [A || #entry{agent = A} <- Es].
 
@@ -1206,21 +1187,6 @@ have_locks(Obj, #state{agents = As}) ->
                       [{{{element,1,
                           {element,2,
                            {element,1,'$_'}}},'$1'}}] }]).
-%% have_locks([#lock{object = Obj,
-%%                   queue = [#w{entries = [#entry{agent = A}]}|_]}|T])
-%%            when A == self() ->
-%%     [{Obj, write} | have_locks(T)];
-%% have_locks([#lock{object = Obj, queue = [#r{entries = Es}|_]}|T]) ->
-%%     case lists:keymember(self(), #entry.agent, Es) of
-%%         true  -> [{Obj, read} | have_locks(T)];
-%%         false -> have_locks(T)
-%%     end;
-%% have_locks([_|T]) ->
-%%     have_locks(T);
-%% have_locks([]) ->
-%%     [].
-
-
 
 l_mode(#lock{queue = [#r{}|_]}) -> read;
 l_mode(#lock{queue = [#w{}|_]}) -> write.
@@ -1228,13 +1194,6 @@ l_mode(#lock{queue = [#w{}|_]}) -> write.
 l_covers(read, write) -> true;
 l_covers(M   , M    ) -> true;
 l_covers(_   , _    ) -> false.
-
-%% l_on_node(O, N, write, HaveLocks) ->
-%%     lists:member({{O,N},write}, HaveLocks);
-%% l_on_node(O, N, read, HaveLocks) ->
-%%     lists:member({{O,N},read}, HaveLocks)
-%%         orelse lists:member({{O,N},write}, HaveLocks).
-
 
 i_add_lock(#state{locks = Ls, sync = Sync} = State,
            #lock{object = Obj} = Lock, Prev) ->
@@ -1282,8 +1241,12 @@ ets_info(T, I)          -> ets:info(T, I).
 
 lock_holders(#lock{queue = [#r{entries = Es}|_]}) ->
     [A || #entry{agent = A} <- Es];
-lock_holders(#lock{queue = [#w{entries = Es}|_]}) ->
-    [A || #entry{agent = A} <- Es].
+lock_holders(#lock{queue = [#w{entries = [#entry{agent = A}]}|_]}) ->
+    %% exclusive lock held
+    [A];
+lock_holders(#lock{queue = [#w{entries = [_,_|_]}|_]}) ->
+    %% contention for write lock; no-one actually holds the lock
+    [].
 
 log_interesting(Prev, #lock{object = OID, queue = Q},
                 #state{interesting = I} = S) ->
@@ -1375,14 +1338,15 @@ analyse(_Agents, #state{interesting = I, locks = Ls}) ->
 	expand_agents([ {hd(L#lock.queue), L#lock.object} ||
                           L <- Locks]),
     Connect =
-	fun({A1, O1}, {A2, _}) ->
-		lists:any(
-		  fun(#lock{object = Obj, queue = Queue}) ->
-                          (O1==Obj)
-                              andalso A1 =/= A2
-                              andalso in(A1, hd(Queue))
-			      andalso in_tail(A2, tl(Queue))
-		  end, Locks)
+	fun({A1, O1}, {A2, _}) when A1 =/= A2 ->
+                lists:any(
+                     fun(#lock{object = Obj, queue = Queue}) ->
+                             (O1=:=Obj)
+                                 andalso in(A1, hd(Queue))
+                                 andalso in_tail(A2, tl(Queue))
+                     end, Locks);
+           (_, _) ->
+                false
 	end,
     ?event({connect, Connect}),
     case locks_cycles:components(Nodes, Connect) of
