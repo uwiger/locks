@@ -740,11 +740,12 @@ handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending,
                 [] ->
                     {noreply, S1};
                 Reissue ->
+                    move_requests(R, Reqs, Pending),
                     S2 = lists:foldl(
                            fun(#req{object = Obj, mode = Mode}, Sx) ->
                                    request_lock({Obj,N}, Mode, Sx)
                            end, ensure_monitor(N, S1), Reissue),
-                    {noreply, S2}
+                    {noreply, check_if_done(S2)}
             end;
         false ->
             {noreply, S}

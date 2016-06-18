@@ -37,7 +37,7 @@
 	 update/4,
 	 update_counter/3]).
 
--export([trace/0, notrace/0]).
+-export([trace/0, trace/1, notrace/0]).
 
 notrace() ->
     application:start(locks),
@@ -52,6 +52,16 @@ trace() ->
     dbg:tpl(locks_agent,x),
     dbg:p(all,[c]),
     ?MODULE:new().
+
+trace(F) when is_function(F, 0) ->
+    application:start(locks),
+    dbg:tracer(),
+    dbg:tpl(locks_leader,x),
+    dbg:tpl(test_cb,x),
+    dbg:tpl(gdict,x),
+    dbg:tpl(locks_agent,x),
+    dbg:p(all,[c]),
+    F().
 
 new() ->
     locks_leader:start_link(test_cb, dict:new()).
