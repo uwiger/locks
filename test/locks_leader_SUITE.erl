@@ -13,6 +13,7 @@
 -export(
    [
     local_dict/1,
+    gdict_simple_netsplit/1,
     gdict_all_nodes/1,
     gdict_netsplit/1,
     start_incremental/1
@@ -41,6 +42,7 @@
 all() ->
     [
      {group, g_local},
+     {group, g_simple},
      {group, g_all},
      {group, g_incr}
     ].
@@ -48,6 +50,8 @@ all() ->
 groups() ->
     [
      {g_local, [], [local_dict]},
+     {g_simple, [], [gdict_all_nodes,
+                     gdict_simple_netsplit]},
      {g_all, [],   [gdict_all_nodes,
                     gdict_netsplit]},
      {g_incr, [], [start_incremental]}
@@ -68,6 +72,10 @@ end_per_suite(_Config) ->
 init_per_group(g_local, Config) ->
     application:start(locks),
     Config;
+init_per_group(g_simple, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(2)),
+    [{slaves, Ns}|Config];
 init_per_group(_Group, Config) ->
     application:start(locks),
     Ns = start_slaves(node_list(5)),
@@ -131,6 +139,42 @@ gdict_all_nodes_(Config) ->
            lists:zip(Ns, [?retry({ok,1}, gdict:find(a,D)) || D <- Dicts])),
     [exit(D, kill) || D <- Dicts],
     proxy_multicall(Ns, application, stop, [locks]),
+    ok.
+
+gdict_simple_netsplit(Config) ->
+    with_trace(fun gdict_simple_netsplit_/1, Config,
+               "leader_tests_simple_netsplit").
+
+gdict_simple_netsplit_(Config) ->
+    Name = [?MODULE, ?LINE],
+    [A, B] = Ns = get_slave_nodes(Config),
+    ok = lists:foreach(
+           fun(ok) -> ok end,
+           proxy_multicall(Ns, application, start, [locks])),
+    Results = proxy_multicall(Ns, gdict, new_opt, [[{resource, Name}]]),
+    Dicts = lists:map(fun({ok,D}) -> D end, Results),
+    wait_for_dicts(Dicts),
+    [X, X] = [locks_leader:info(Dx, leader) || Dx <- Dicts],
+    locks_ttb:event(initial_consensus),
+    call_proxy(A, erlang, disconnect_node, [B]),
+    [] = call_proxy(A, erlang, nodes, []),
+    [] = call_proxy(B, erlang, nodes, []),
+    locks_ttb:event(netsplit_ready),
+    wait_for_dicts(Dicts),
+    [L1,L2] = [locks_leader:info(Dx, leader) || Dx <- Dicts],
+    true = (L1 =/= L2),
+    locks_ttb:event(reconnecting),
+    proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
+    proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
+    [B] = call_proxy(A, erlang, nodes, []),
+    [Z,Z] = ?retry([Z,Z], call_proxy(A, ?MODULE, leader_nodes, [Dicts])),
+    locks_ttb:event({leader_consensus, Ns, Z}),
+    proxy_multicall(Ns, application, stop, [locks]),
+    ok.
+
+%% wait for leaders to get out of safe loop
+wait_for_dicts(Dicts) ->
+    [false = gdict:is_key(no_key, D) || D <- Dicts],
     ok.
 
 gdict_netsplit(Config) ->
@@ -215,8 +259,8 @@ with_trace(F, Config, Name) ->
     try F(Config)
     catch
         error:R ->
-            ttb_stop(),
             Stack = erlang:get_stacktrace(),
+            ttb_stop(),
             ct:log("Error ~p; Stack = ~p~n", [R, Stack]),
             erlang:error(R);
         exit:R ->
@@ -251,6 +295,8 @@ insert_initial(D, []) ->
 insert_initial(_, _) ->
     ok.
 
+node_list(N) when is_integer(N), N > 0, N < 5 ->
+    lists:sublist(node_list(5), 1, N);
 node_list(5) ->
     [locks_1, locks_2, locks_3, locks_4, locks_5].
 
@@ -279,6 +325,7 @@ connect_nodes(Ns) ->
     ok.
 
 leader_nodes(Ds) ->
+    wait_for_dicts(Ds),
     [node(locks_leader:info(D, leader)) || D <- Ds].
 
 -define(PROXY, locks_leader_test_proxy).
