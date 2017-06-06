@@ -42,19 +42,31 @@
 all() ->
     [
      {group, g_local},
-     {group, g_simple},
-     {group, g_all},
-     {group, g_incr}
+     {group, g_2},
+     {group, g_3},
+     {group, g_4},
+     {group, g_5},
+     {group, g_2i},
+     {group, g_3i},
+     {group, g_4i},
+     {group, g_5i}
     ].
 
 groups() ->
     [
      {g_local, [], [local_dict]},
-     {g_simple, [], [gdict_all_nodes,
-                     gdict_simple_netsplit]},
-     {g_all, [],   [gdict_all_nodes,
-                    gdict_netsplit]},
-     {g_incr, [], [start_incremental]}
+     {g_2, [], [gdict_all_nodes,
+                gdict_simple_netsplit]},
+     {g_3, [], [gdict_all_nodes,
+                gdict_netsplit]},
+     {g_4, [], [gdict_all_nodes,
+                gdict_netsplit]},
+     {g_5, [],   [gdict_all_nodes,
+                  gdict_netsplit]},
+     {g_2i, [], [start_incremental]},
+     {g_3i, [], [start_incremental]},
+     {g_4i, [], [start_incremental]},
+     {g_5i, [], [start_incremental]}
     ].
 
 suite() ->
@@ -72,11 +84,35 @@ end_per_suite(_Config) ->
 init_per_group(g_local, Config) ->
     application:start(locks),
     Config;
-init_per_group(g_simple, Config) ->
+init_per_group(g_2, Config) ->
     application:start(locks),
     Ns = start_slaves(node_list(2)),
     [{slaves, Ns}|Config];
-init_per_group(_Group, Config) ->
+init_per_group(g_3, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(3)),
+    [{slaves, Ns}|Config];
+init_per_group(g_4, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(4)),
+    [{slaves, Ns}|Config];
+init_per_group(g_5, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(5)),
+    [{slaves, Ns}|Config];
+init_per_group(g_2i, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(2)),
+    [{slaves, Ns}|Config];
+init_per_group(g_3i, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(3)),
+    [{slaves, Ns}|Config];
+init_per_group(g_4i, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(4)),
+    [{slaves, Ns}|Config];
+init_per_group(g_5i, Config) ->
     application:start(locks),
     Ns = start_slaves(node_list(5)),
     [{slaves, Ns}|Config].
@@ -182,8 +218,8 @@ gdict_netsplit(Config) ->
 
 gdict_netsplit_(Config) ->
     Name = [?MODULE, ?LINE],
-    [A,B,C,D,E] = Ns = get_slave_nodes(Config),
-    proxy_multicall([A,B], ?MODULE, disconnect_nodes, [[C,D,E]]),
+    [A,B|[C|_] = Rest] = Ns = get_slave_nodes(Config),
+    proxy_multicall([A,B], ?MODULE, disconnect_nodes, [Rest]),
     [B] = call_proxy(A, erlang, nodes, []),
     [A] = call_proxy(B, erlang, nodes, []),
     locks_ttb:event(netsplit_ready),
@@ -191,7 +227,7 @@ gdict_netsplit_(Config) ->
            fun(ok) -> ok end,
            proxy_multicall(Ns, application, start, [locks])),
     Results = proxy_multicall(Ns, gdict, new_opt, [[{resource, Name}]]),
-    [Da,Db,Dc,Dd,De] = Dicts = lists:map(fun({ok,Dx}) -> Dx end, Results),
+    [Da,Db|[Dc|_] = DRest] = Dicts = lists:map(fun({ok,Dx}) -> Dx end, Results),
     locks_ttb:event({dicts_created, lists:zip(Ns, Dicts)}),
     ok = ?retry(ok, gdict:store(a, 1, Da)),
     ok = gdict:store(b, 2, Dc),
@@ -199,19 +235,21 @@ gdict_netsplit_(Config) ->
     error = gdict:find(a, Dc),
     [X,X] = [locks_leader:info(Dx, leader) || Dx <- [Da,Db]],
     locks_ttb:event({leader_consensus, [Da,Db], X}),
-    [Y,Y,Y] = [locks_leader:info(Dx, leader) || Dx <- [Dc,Dd,De]],
-    locks_ttb:event({leader_consensus, [Dc,Dd,De], Y}),
+    RestLeaders = [locks_leader:info(Dx, leader) || Dx <- DRest],
+    [Y] = lists:usort(RestLeaders),
+    locks_ttb:event({leader_consensus, DRest, Y}),
     true = (X =/= Y),
-    {ok, 2} = ?retry({ok,2}, gdict:find(b, Dc)),
-    {ok, 2} = ?retry({ok,2}, gdict:find(b, Dd)),
-    {ok, 2} = ?retry({ok,2}, gdict:find(b, De)),
+    lists:foreach(
+      fun(Dx) ->
+              {ok, 2} = ?retry({ok,2}, gdict:find(b, Dx))
+      end, DRest),
     error = gdict:find(b, Da),
     locks_ttb:event(reconnecting),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
     proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
-    [B,C,D,E] = lists:sort(call_proxy(A, erlang, nodes, [])),
-    [Z,Z,Z,Z,Z] = ?retry([Z,Z,Z,Z,Z],
-                         call_proxy(A, ?MODULE, leader_nodes, [Dicts])),
+    [B,C|_] = lists:sort(call_proxy(A, erlang, nodes, [])),
+    [Z] = ?retry([_],
+                lists:usort(call_proxy(A, ?MODULE, leader_nodes, [Dicts]))),
     locks_ttb:event({leader_consensus, Ns, Z}),
     {ok, 1} = ?retry({ok,1}, gdict:find(a, Dc)),
     {ok, 2} = ?retry({ok,2}, gdict:find(b, Da)),
@@ -267,7 +305,8 @@ with_trace(F, Config, Name) ->
             ttb_stop(),
             exit(R)
     end,
-    locks_ttb:stop_nofetch(),
+    %% locks_ttb:stop_nofetch(),
+    locks_ttb:stop(),
     ok.
 
 ttb_stop() ->

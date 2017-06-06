@@ -123,7 +123,7 @@
 	  lock,
 	  agent,
 	  leader,
-	  nodes = [],
+	  nodes = ordsets:new(),
 	  candidates = [],
 	  workers = [],
           synced = [],
@@ -452,7 +452,7 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		error:Error ->
 		    abort_init({Error, erlang:get_stacktrace()}, Parent)
 	    end,
-    AllNodes = [node()|nodes()],
+    AllNodes = ordsets:from_list([node()|nodes()]),
     Agent =
 	case Role of
 	    candidate ->
@@ -560,7 +560,7 @@ handle_info({nodeup, N}, #st{role = candidate} = S) ->
     noreply(nodeup(N, S));
 handle_info({nodedown, N}, #st{nodes = Nodes}  =S) ->
     ?event({nodedown, N}, S),
-    noreply(S#st{nodes = Nodes -- [N]});
+    noreply(S#st{nodes = ordsets:del_element(N, Nodes)});
 handle_info({'DOWN', _, _, _, _} = Msg, S) ->
     ?event({handle_info, Msg}, S),
     noreply(down(Msg, S));
@@ -683,7 +683,7 @@ code_change(_, St, _) ->
 
 
 nodeup(N, #st{nodes = Nodes} = S) ->
-    case lists:member(N, Nodes) of
+    case ordsets:is_element(N, Nodes) of
         true ->
             S;
         false ->
@@ -693,7 +693,7 @@ nodeup(N, #st{nodes = Nodes} = S) ->
 include_node(N, #st{agent = A, lock = Lock, nodes = Nodes} = S) ->
     ?event({include_node, N}),
     locks_agent:lock_nowait(A, Lock, write, [N], all_alive),
-    S#st{nodes = [N|Nodes]}.
+    S#st{nodes = ordsets:add_element(N, Nodes)}.
 
 locks_info(#locks_info{lock = #lock{object = Lock} = L,
                        where = Node} = _I, #st{lock = Lock} = S) ->
@@ -705,7 +705,7 @@ lock_info(#lock{queue = Q}, Node, #st{} = S) ->
     NewCands = new_cands(Node, Q, S),
     lists:foldl(fun(C, #st{nodes = Nodes} = Acc) ->
                         N = node(C),
-                        SAcc = case lists:member(N, Nodes) of
+                        SAcc = case ordsets:is_element(N, Nodes) of
                                    true -> Acc;
                                    false -> include_node(N, Acc)
                                end,
