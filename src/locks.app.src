@@ -14,12 +14,16 @@
 {application, locks,
  [
   {description, "Scalable deadlock-resolving hierarchical locker"},
-  {vsn, "1"},
+  {vsn, "0.1.0"},
   {registered, []},
   {applications, [
                   kernel,
                   stdlib
                  ]},
   {mod, { locks_app, []}},
-  {env, []}
+  {env, []},
+
+  {maintainers, ["Ulf Wiger"]},
+  {licenses, ["MPL 2.0"]},
+  {links, [{"Github", "https://github.com/uwiger/locks"}]}
  ]}.
