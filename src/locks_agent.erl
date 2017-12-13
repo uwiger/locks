@@ -48,6 +48,7 @@
 	 lock_objects/2,
          surrender_nowait/4,
 	 await_all_locks/1,
+         async_await_all_locks/1,
          monitor_nodes/2,
          change_flag/3,
 	 lock_info/1,
@@ -102,14 +103,17 @@
               claim_no = 0,
               require = all}).
 
+-type monitored_nodes() :: [{node(), reference()}].
+-type down_nodes()      :: [node()].
+
 -record(state, {
           locks            :: ets:tab(),
           agents           :: ets:tab(),
           interesting = [] :: [lock_id()],
           claim_no = 0     :: integer(),
           requests         :: ets:tab(),
-          down = []        :: [node()],
-          monitored = []   :: [{node(), reference()}],
+          down = []        :: down_nodes(),
+          monitored = []   :: monitored_nodes(),
           await_nodes = false :: boolean(),
           monitor_nodes = false :: boolean(),
           pending          :: ets:tab(),
@@ -332,6 +336,9 @@ begin_transaction(Objects, Opts) ->
 await_all_locks(Agent) ->
     call(Agent, await_all_locks,infinity).
 
+async_await_all_locks(Agent) ->
+    cast(Agent, {await_all_locks, self()}).
+
 -spec monitor_nodes(agent(), boolean()) -> boolean().
 %% @doc Toggles monitoring of nodes, like net_kernel:monitor_nodes/1.
 %%
@@ -390,6 +397,9 @@ change_flag(Agent, Option, Bool)
        is_boolean(Bool), Option == await_nodes;
        is_boolean(Bool), Option == notify ->
     gen_server:cast(Agent, {option, Option, Bool}).
+
+cast(Agent, Msg) ->
+    gen_server:cast(Agent, Msg).
 
 cast(Agent, Msg, Ref) ->
     gen_server:cast(Agent, Msg),
@@ -540,6 +550,15 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Req,
                         new_request(Object, Mode, Nodes, Require, S1))};
         {true, S1} ->
             {noreply, check_if_done(S1)}
+    end;
+handle_cast({await_all_locks, Pid},
+            #state{status = Status, awaiting_all = Aw} = State) ->
+    case Status of
+        {have_all_locks, _} ->
+            {noreply, notify_have_all(
+                        State#state{awaiting_all = [{Pid,async}|Aw]})};
+        _ ->
+            {noreply, check_if_done(add_waiter(wait, Pid, async, State))}
     end;
 handle_cast({surrender, O, ToAgent, Nodes} = _Req, S) ->
     ?event(_Req, S),
@@ -926,8 +945,13 @@ have_all(#state{have_all = Prev, claim_no = Cl} = State) ->
     notify_have_all(State#state{have_all = true, claim_no = Cl1}).
 
 notify_have_all(#state{awaiting_all = Aw, status = Status} = S) ->
-    [gen_server:reply(W, Status) || W <- Aw],
+    [reply_await_(W, Status) || W <- Aw],
     S#state{awaiting_all = []}.
+
+reply_await_({Pid, notify}, Status) ->
+    notify_(Pid, Status);
+reply_await_(From, Status) ->
+    gen_server:reply(From, Status).
 
 abort_on_deadlock(OID, State) ->
     notify({abort, Reason = {deadlock, OID}}, State),
@@ -939,10 +963,13 @@ notify_msgs([M|Ms], S) ->
 notify_msgs([], S) ->
     S.
 
-
 notify(Msg, #state{notify = Notify} = State) ->
-    [P ! {?MODULE, self(), Msg} || P <- Notify],
+    [notify_(P, Msg) || P <- Notify],
     State.
+
+notify_(P, Msg) ->
+    P ! {?MODULE, self(), Msg}.
+
 
 handle_locks(#state{have_all = true} = State) ->
     %% If we have all locks we've asked for, no need to search for potential
