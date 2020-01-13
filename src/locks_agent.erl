@@ -950,6 +950,8 @@ notify_have_all(#state{awaiting_all = Aw, status = Status} = S) ->
 
 reply_await_({Pid, notify}, Status) ->
     notify_(Pid, Status);
+reply_await_({Pid, async}, Status) ->
+    notify_(Pid, Status);
 reply_await_(From, Status) ->
     gen_server:reply(From, Status).
 
