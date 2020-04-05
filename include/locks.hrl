@@ -19,7 +19,7 @@
 -type agent()    :: pid().
 -type tid()      :: any().
 
--type lock_id()  :: {oid(), node()}.
+-type lock_id()  :: {oid() | '_', node()}.
 
 -type obj()      :: {oid(), mode()}
 		  | {oid(), mode(), where()}
@@ -27,10 +27,12 @@
 
 -type objs()     :: [obj()].
 
--type options() :: [{link, boolean()}
-		    | {client, pid()}
-		    | {abort_on_error, boolean()}
-		    | {abort_on_deadlock, boolean()}].
+-type options() :: [option()].
+-type option() :: {link, boolean()}
+                | {client, pid()}
+                | {abort_on_error, boolean()}
+                | {await_nodes, boolean()}
+                | {abort_on_deadlock, boolean()}.
 
 -type deadlocks() :: [lock_id()].
 
@@ -60,7 +62,7 @@
 	  version = 1    :: integer()     | '_',
 	  pid = self()   :: pid()         | '_',
 	  queue = []     :: [#r{} | #w{}] | '_',
-	  watchers = [] :: [pid()]
+	  watchers = [] :: [pid()] | '_'
          }).
 
 -record(locks_info, {

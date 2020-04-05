@@ -1,10 +1,5 @@
 -include("locks.hrl").
 
--type option()      :: {client, pid()}
-                     | {abort_on_deadlock, boolean()}
-                     | {await_nodes, boolean()}
-                     | {notify, boolean()}.
-
 -type transaction_status() :: no_locks
                             | {have_all_locks, list()}
                             | waiting
@@ -35,7 +30,7 @@
           client_mref      :: reference(),
           options = []     :: [option()],
           notify = []      :: [pid()],
-          awaiting_all = []:: [{pid(), reference()}],
+          awaiting_all = []:: [{pid(), reference() | async}],
           answer           :: locking | waiting | done,
           deadlocks = []   :: deadlocks(),
           have_all = false :: boolean(),

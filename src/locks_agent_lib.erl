@@ -29,6 +29,7 @@
         , request_lock/3
         , ensure_monitor/2
         , request_can_be_served/2
+        , in_tail/2
         , add_msgs/2 ]).
 
 -import(lists,[foreach/2,any/2,map/2,member/2]).

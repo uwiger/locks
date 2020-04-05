@@ -1,7 +1,7 @@
 -module(locks_ttb).
 
 -compile([export_all, nowarn_export_all]).
-
+-dialyzer({nowarn_function, pp_term/1}).
 
 %% This function is also traced. Can be used to insert markers in the trace
 %% log.

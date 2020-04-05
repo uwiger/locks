@@ -413,7 +413,7 @@ get_locks([ID|T], _A, ID, _Vis, _Agents, Locks) ->
 get_locks([H|T], A, ID, Vis, Agents, Locks) ->
     #lock{queue = Q} = L = get_lock(Locks, H),
     case find_first_entry(Q, A) of
-        #entry{type = indirect} ->
+        {_Mode, #entry{type = indirect}} ->
             %% Must include possible direct-lock children that were not
             %% in the original set (since they intersect in indirect-lock
             %% parents). Don't fetch any lock twice.

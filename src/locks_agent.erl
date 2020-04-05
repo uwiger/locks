@@ -180,10 +180,10 @@ agent_init(Wait, Client, Options) ->
                        {reason, Error},
                        {trace, erlang:get_stacktrace()}]),
                     error(Error)
-            end;
-        Other ->
-            ack(Wait, Client, {error, Other}),
-            error(Other)
+            end
+        %% Other ->
+        %%     ack(Wait, Client, {error, Other}),
+        %%     error(Other)
     end.
 
 await_pid(false, Pid) ->
@@ -228,9 +228,9 @@ handle_msg({'$gen_call', From, Req}, St) ->
             St1;
         {stop, Reason, Reply, _} ->
             gen_server:reply(From, Reply),
-            exit(Reason);
-        {stop, Reason, _} ->
             exit(Reason)
+        %% {stop, Reason, _} ->
+        %%     exit(Reason)
     end;
 handle_msg({'$gen_cast', Msg}, St) ->
     case handle_cast(Msg, St) of
@@ -810,8 +810,8 @@ notify_have_all(#state{awaiting_all = Aw, status = Status} = S) ->
     [reply_await_(W, Status) || W <- Aw],
     S#state{awaiting_all = []}.
 
-reply_await_({Pid, notify}, Status) ->
-    notify_(Pid, Status);
+%% reply_await_({Pid, notify}, Status) ->
+%%     notify_(Pid, Status);
 reply_await_({Pid, async}, Status) ->
     notify_(Pid, Status);
 reply_await_(From, Status) ->

@@ -95,9 +95,9 @@
 
 -export_type([mod_state/0, msg/0, election/0]).
 
--type option() :: {role, candidate | worker}
-                | {resource, any()}.
--type ldr_options() :: [option()].
+-type ldr_option() :: {role, candidate | worker}
+                    | {resource, any()}.
+-type ldr_options() :: [ldr_option()].
 -type mod_state() :: any().
 -type msg() :: any().
 -type reply() :: any().
@@ -136,6 +136,13 @@
 	  buffered = []}).
 
 -include("locks.hrl").
+-include("locks_debug.hrl").
+
+-ifdef(LOCKS_DEBUG).
+-define(log(X, S), dbg_log(X, S)).
+-else.
+-define(log(X, S), ok).
+-endif.
 
 -define(event(E), event(?LINE, E, none)).
 -define(event(E, S), event(?LINE, E, S)).
@@ -211,6 +218,7 @@ leader_node(#st{}) ->
 %% safe.
 %% @end
 reply(From, Reply) ->
+    ?log({'$reply', From, Reply}),
     gen_server:reply(From, Reply).
 
 -spec broadcast(any(), election()) -> ok.
@@ -380,7 +388,7 @@ leader_call(L, Request, Timeout) ->
     end.
 
 leader_reply(From, Reply) ->
-    gen_server:reply(From, {'$locks_leader_reply', Reply}).
+    reply(From, {'$locks_leader_reply', Reply}).
 
 -spec leader_cast(L::server_ref(), Msg::term()) -> ok.
 %% @doc Make an asynchronous cast to the leader.
@@ -472,18 +480,19 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		undefined
 	end,
     proc_lib:init_ack(Parent, {ok, self()}),
-    case safe_loop(#st{agent = Agent,
-		       role = Role,
-		       mod = Module,
-		       mod_state = ModSt,
-		       lock = Lock,
-		       %% mode = Mode,
-		       nodes = AllNodes,
-		       regname = Reg}) of
+    S1 = #st{agent = Agent,
+             role = Role,
+             mod = Module,
+             mod_state = ModSt,
+             lock = Lock,
+             %% mode = Mode,
+             nodes = AllNodes,
+             regname = Reg},
+    case safe_loop(S1) of
 	{stop, StopReason, _} ->
 	    error(StopReason);
 	_ ->
-	    ok
+	    {ok, S1}  % we should never get here, but it makes dialyzer happy
     end.
 
 default_lock(Mod, undefined) -> Mod;
@@ -516,10 +525,12 @@ noreply(Stop) when element(1, Stop) == stop ->
 %% We enter safe_loop/1 as soon as no leader is elected
 safe_loop(#st{agent = A} = S) ->
     receive
-	{nodeup, N} ->
+	{nodeup, N} = _Msg ->
+            ?log(_Msg, S),
 	    ?event({nodeup, N, nodes()}, S),
 	    noreply(nodeup(N, S));
 	{locks_agent, A, Info} = _Msg ->
+            ?log(_Msg),
 	    ?event(_Msg, S),
 	    case Info of
                 #locks_info{} ->
@@ -531,33 +542,44 @@ safe_loop(#st{agent = A} = S) ->
                     noreply(S)
 	    end;
 	#locks_info{} = I ->   % if worker - direct from locks_server
+            ?log(I, S),
 	    ?event(I, S),
 	    noreply(locks_info(I, S));
 	{?MODULE, am_leader, L, ERef, LeaderMsg} = _Msg ->
+            ?log(_Msg, S),
 	    ?event(_Msg, S),
 	    noreply(leader_announced(L, ERef, LeaderMsg, S));
         {?MODULE, from_leader, L, ERef, LeaderMsg} = _Msg ->
+            ?log(_Msg, S),
             ?event(_Msg, S),
             noreply(from_leader(L, ERef, LeaderMsg, S));
 	{?MODULE, am_worker, W} = _Msg ->
+            ?log(_Msg, S),
 	    ?event(_Msg, S),
 	    noreply(worker_announced(W, S));
         {?MODULE, leader_uncertain, _L, _Synced, _SyncedWs} = _Msg ->
+            ?log(_Msg, S),
             ?event(_Msg, S),
             noreply(S);
         {?MODULE, affirm_leader, L, Ref} = _Msg ->
+            ?log(_Msg, S),
             ?event({in_safe_loop, _Msg}, S),
             noreply(leader_affirmed(L, Ref, S));
         {?MODULE, ensure_sync, _, _} = _Msg ->
+            ?log(_Msg, S),
             ?event({in_safe_loop, _Msg}, S),
             noreply(S);
-        {'$gen_call', From, '$locks_leader_debug'} ->
+        {'$gen_call', From, '$locks_leader_debug'} = _Msg ->
+            ?log(_Msg, S),
             handle_call('$locks_leader_debug', From, S);
-        {'$gen_call', From, '$info'} ->
+        {'$gen_call', From, '$info'} = _Msg ->
+            ?log(_Msg, S),
             handle_call('$locks_leader_info', From, S);
-        {'$gen_call', From, {'$locks_leader_info', Item}} ->
+        {'$gen_call', From, {'$locks_leader_info', Item}} = _Msg ->
+            ?log(_Msg, S),
             handle_call({'$locks_leader_info', Item}, From, S);
-        {'$gen_call', {_, {?MODULE, _Ref}} = From, Req} ->
+        {'$gen_call', {_, {?MODULE, _Ref}} = From, Req} = _Msg ->
+            ?log(_Msg, S),
             %% locks_leader-tagged call; handle also in safe loop
             ?event({safe_call, Req}),
             #st{mod = M, mod_state = MSt} = S,
@@ -565,6 +587,7 @@ safe_loop(#st{agent = A} = S) ->
               callback_reply(M:handle_call(Req, From, MSt, opaque(S)),
                              From, fun unchanged/1, S));
 	{'DOWN',_,_,_,_} = DownMsg ->
+            ?log(DownMsg, S),
 	    ?event(DownMsg, S),
 	    noreply(down(DownMsg, S))
     end.
@@ -573,16 +596,20 @@ event(_Line, _Event, _State) ->
     ok.
 
 %% @private
-handle_info({nodeup, N}, #st{role = candidate} = S) ->
+handle_info(Msg, S) ->
+    ?log(Msg, S),
+    handle_info_(Msg, S).
+
+handle_info_({nodeup, N}, #st{role = candidate} = S) ->
     ?event({handle_info, {nodeup, N, nodes()}}, S),
     noreply(nodeup(N, S));
-handle_info({nodedown, N}, #st{nodes = Nodes}  =S) ->
+handle_info_({nodedown, N}, #st{nodes = Nodes}  =S) ->
     ?event({nodedown, N}, S),
     noreply(S#st{nodes = ordsets:del_element(N, Nodes)});
-handle_info({'DOWN', _, _, _, _} = Msg, S) ->
+handle_info_({'DOWN', _, _, _, _} = Msg, S) ->
     ?event({handle_info, Msg}, S),
     noreply(down(Msg, S));
-handle_info({locks_agent, A, Info} = _Msg, #st{agent = A} = S) ->
+handle_info_({locks_agent, A, Info} = _Msg, #st{agent = A} = S) ->
     ?event({handle_info, _Msg}, S),
     case Info of
 	#locks_info{}      -> noreply(locks_info(Info, S));
@@ -592,7 +619,7 @@ handle_info({locks_agent, A, Info} = _Msg, #st{agent = A} = S) ->
         _ ->
             noreply(S)
     end;
-handle_info({?MODULE, leader_uncertain, L, Synced, SyncedWs}, S) ->
+handle_info_({?MODULE, leader_uncertain, L, Synced, SyncedWs}, S) ->
     ?event({leader_uncertain, {{L, Synced, SyncedWs}, S#st.leader}}),
     case S#st.leader of
         MyL when MyL == self() ->
@@ -611,10 +638,10 @@ handle_info({?MODULE, leader_uncertain, L, Synced, SyncedWs}, S) ->
         _OtherL ->
             noreply(S)
     end;
-handle_info({?MODULE, affirm_leader, L, ERef} = _Msg, #st{} = S) ->
+handle_info_({?MODULE, affirm_leader, L, ERef} = _Msg, #st{} = S) ->
     ?event(_Msg, S),
     noreply(leader_affirmed(L, ERef, S));
-handle_info({?MODULE, ensure_sync, Pid, Type} = _Msg, #st{} = S) ->
+handle_info_({?MODULE, ensure_sync, Pid, Type} = _Msg, #st{} = S) ->
     ?event(_Msg, S),
     S1 = case S#st.leader of
              Me when Me == self() ->
@@ -623,36 +650,40 @@ handle_info({?MODULE, ensure_sync, Pid, Type} = _Msg, #st{} = S) ->
                  S
          end,
     noreply(S1);
-handle_info({?MODULE, am_worker, W} = _Msg, #st{} = S) ->
+handle_info_({?MODULE, am_worker, W} = _Msg, #st{} = S) ->
     ?event({handle_info, _Msg}, S),
     noreply(worker_announced(W, S));
-handle_info(#locks_info{lock = #lock{object = Lock}} = I,
-	    #st{lock = Lock} = S) ->
-    {noreply, locks_info(I, S)};
-handle_info({?MODULE, am_leader, L, ERef, LeaderMsg} = _M, S) ->
+handle_info_(#locks_info{lock = #lock{object = Lock}} = I,
+             #st{lock = Lock} = S) ->
+    noreply(locks_info(I, S));
+handle_info_({?MODULE, am_leader, L, ERef, LeaderMsg} = _M, S) ->
     ?event({handle_info, _M}, S),
     noreply(leader_announced(L, ERef, LeaderMsg, S));
-handle_info({?MODULE, from_leader, L, ERef, LeaderMsg} = _M, S) ->
+handle_info_({?MODULE, from_leader, L, ERef, LeaderMsg} = _M, S) ->
     ?event({handle_info, _M}, S),
     noreply(from_leader(L, ERef, LeaderMsg, S));
-handle_info({Ref, {'$locks_leader_reply', Reply}} = _M,
+handle_info_({Ref, {'$locks_leader_reply', Reply}} = _M,
 	    #st{buffered = Buf} = S) ->
     ?event({handle_info, _M}, S),
     case lists:keytake(Ref, 1, Buf) of
 	{value, {_, OrigRef}, Buf1} ->
-	    gen_server:reply(OrigRef, {'$locks_leader_reply', Reply}),
+	    reply(OrigRef, {'$locks_leader_reply', Reply}),
 	    noreply(S#st{buffered = Buf1});
 	false ->
 	    noreply(S)
     end;
-handle_info(Msg, #st{mod = M, mod_state = MSt} = S) ->
+handle_info_(Msg, #st{mod = M, mod_state = MSt} = S) ->
     ?event({handle_info, Msg}, S),
     noreply(callback(M:handle_info(Msg, MSt, opaque(S)), S)).
 
 
 %% @private
-handle_cast({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
-						    leader = L} = S) ->
+handle_cast(Msg, S) ->
+    ?log({'$cast', Msg}, S),
+    handle_cast_(Msg, S).
+
+handle_cast_({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
+                                                     leader = L} = S) ->
     if L == self() ->
 	    noreply(callback(M:handle_leader_cast(Msg, MSt, opaque(S)), S));
        is_pid(L) ->
@@ -661,17 +692,21 @@ handle_cast({'$locks_leader_cast', Msg} = Cast, #st{mod = M, mod_state = MSt,
        true ->
             noreply(S)
     end;
-handle_cast(Msg, #st{mod = M, mod_state = MSt} = St) ->
+handle_cast_(Msg, #st{mod = M, mod_state = MSt} = St) ->
     noreply(callback(M:handle_cast(Msg, MSt, opaque(St)), St)).
 
 
 %% @private
-handle_call(Req, {_, {?MODULE, _Ref}} = From,
-            #st{mod = M, mod_state = MSt} = S) ->
+handle_call(Req, From, S) ->
+    ?log({'$call', Req, From}, S),
+    handle_call_(Req, From, S).
+
+handle_call_(Req, {_, {?MODULE, _Ref}} = From,
+             #st{mod = M, mod_state = MSt} = S) ->
     noreply(
       callback_reply(M:handle_call(Req, From, MSt, opaque(S)), From,
                     fun unchanged/1, S));
-handle_call('$locks_leader_debug', From, S) ->
+handle_call_('$locks_leader_debug', From, S) ->
     I = [{leader, leader(S)},
          {leader_node, leader_node(S)},
          {candidates, candidates(S)},
@@ -680,9 +715,9 @@ handle_call('$locks_leader_debug', From, S) ->
          {module, S#st.mod},
          {mod_state, S#st.mod_state},
          {process_info, process_info(self())}],
-    gen_server:reply(From, I),
+    reply(From, I),
     noreply(S);
-handle_call('$locks_leader_info', From, S) ->
+handle_call_('$locks_leader_info', From, S) ->
     I = [{leader, leader(S)},
          {leader_node, leader_node(S)},
          {candidates, candidates(S)},
@@ -690,9 +725,9 @@ handle_call('$locks_leader_info', From, S) ->
          {workers, workers(S)},
          {module, S#st.mod},
          {mod_state, S#st.mod_state}],
-    gen_server:reply(From, I),
+    reply(From, I),
     noreply(S);
-handle_call({'$locks_leader_info', Item}, From, S) ->
+handle_call_({'$locks_leader_info', Item}, From, S) ->
     I = case Item of
             leader -> leader(S);
             leader_node -> leader_node(S);
@@ -703,11 +738,11 @@ handle_call({'$locks_leader_info', Item}, From, S) ->
             mod_state      -> S#st.mod_state;
             _ -> undefined
         end,
-    gen_server:reply(From, I),
+    reply(From, I),
     noreply(S);
-handle_call({'$locks_leader_call', Req} = Msg, From,
-	    #st{mod = M, mod_state = MSt, leader = L,
-		buffered = Buf} = S) ->
+handle_call_({'$locks_leader_call', Req} = Msg, From,
+             #st{mod = M, mod_state = MSt, leader = L,
+                 buffered = Buf} = S) ->
     if L == self() ->
 	    noreply(
 	      callback_reply(
@@ -719,11 +754,10 @@ handle_call({'$locks_leader_call', Req} = Msg, From,
 	    catch erlang:send(L, {'$gen_call', NewFrom, Msg}, [noconnect]),
 	    noreply(S#st{buffered = [{MyRef, From}|Buf]})
     end;
-handle_call(R, F, #st{mod = M, mod_state = MSt} = S) ->
+handle_call_(R, F, #st{mod = M, mod_state = MSt} = S) ->
     noreply(
       callback_reply(M:handle_call(R, F, MSt, opaque(S)), F,
                      fun unchanged/1, S)).
-		     %% fun(R1) -> R1 end, S)).
 
 unchanged(X) ->
     X.
@@ -784,7 +818,7 @@ down({'DOWN', Ref, _, Pid, _} = Msg,
 	    callback(M:handle_info(Msg, MSt, opaque(S)), S);
 	Type ->
 	    S1 = if Pid == LPid ->
-			 [gen_server:reply(From,'$leader_died')
+			 [reply(From,'$leader_died')
 			  || {_, From} <- S#st.buffered],
 			 S#st{leader = undefined, buffered = [],
                               synced = [], synced_workers = []};
@@ -801,7 +835,7 @@ add_cand(Client, #st{candidates = Cands, role = Role} = S) ->
             monitor_cand(Client),
             S1 = S#st{candidates = [Client | Cands]},
 	    if Role == worker ->
-		    Client ! {?MODULE, am_worker, self()},
+                    snd(Client, {?MODULE, am_worker, self()}),
                     S1;
 	       true ->
                     maybe_announce_leader(Client, candidate, S1)
@@ -826,14 +860,14 @@ maybe_announce_leader(Pid, Type, #st{leader = L, mod = M,
             ?event({elected_result, ERes}),
             case ERes of
 		{reply, Msg, MSt1} ->
-		    Pid ! msg(am_leader, ERef, Msg),
+		    snd(Pid, msg(am_leader, ERef, Msg)),
                     mark_as_synced(Pid, Type, S#st{mod_state = MSt1});
 		{ok, Msg, MSt1} ->
-                    Pid ! msg(am_leader, ERef, Msg),
+                    snd(Pid, msg(am_leader, ERef, Msg)),
 		    S1 = do_broadcast(S#st{mod_state = MSt1}, Msg),
                     mark_as_synced(Pid, Type, S1);
                 {ok, AmLdrMsg, FromLdrMsg, MSt1} ->
-                    Pid ! msg(am_leader, ERef, AmLdrMsg),
+                    snd(Pid, msg(am_leader, ERef, AmLdrMsg)),
                     S1 = do_broadcast(S#st{mod_state = MSt1}, FromLdrMsg),
                     mark_as_synced(Pid, Type, S1);
                 {surrender, Other, MSt1} ->
@@ -965,13 +999,13 @@ callback({stop, Reason, MSt}, S) ->
 
 
 callback_reply({reply, Reply, MSt}, From, F, S) ->
-    gen_server:reply(From, F(Reply)),
+    reply(From, F(Reply)),
     S#st{mod_state = MSt};
 callback_reply({reply, Reply, Msg, MSt}, From, F, S) ->
     if S#st.leader == self() ->
 	    S1 = S#st{mod_state = MSt},
 	    do_broadcast(S1, Msg),
-	    gen_server:reply(From, F(Reply)),
+	    reply(From, F(Reply)),
 	    S1;
        true ->
 	    error(not_leader)
@@ -979,7 +1013,7 @@ callback_reply({reply, Reply, Msg, MSt}, From, F, S) ->
 callback_reply({noreply, MSt}, _, _, S) ->
     S#st{mod_state = MSt};
 callback_reply({stop, Reason, Reply, MSt}, From, F, S) ->
-    gen_server:reply(From, F(Reply)),
+    reply(From, F(Reply)),
     {stop, Reason, S#st{mod_state = MSt}};
 callback_reply({stop, Reason, MSt}, _, _, S) ->
     {stop, Reason, S#st{mod_state = MSt}}.
@@ -1004,8 +1038,13 @@ send_all(#st{candidates = Cands, workers = Ws}, Msg) ->
     do_broadcast_(Ws, Msg).
 
 do_broadcast_(Pids, Msg) when is_list(Pids) ->
+    ?log({'$bcast', Pids, Msg}),
     [P ! Msg || P <- Pids],
     ok.
+
+snd(Pid, Msg) ->
+    ?log({'$snd', Pid, Msg}),
+    Pid ! Msg.
 
 from_leader(L, ERef, Msg, #st{leader = L, election_ref = ERef,
                               mod = M, mod_state = MSt} = S) ->
@@ -1050,7 +1089,7 @@ leader_affirmed(L, ERef, #st{} = S) ->
     request_sync(L, ERef, S).
 
 request_sync(L, ERef, S) ->
-    L ! {?MODULE, ensure_sync, self(), S#st.role},
+    snd(L, {?MODULE, ensure_sync, self(), S#st.role}),
     S#st{leader = undefined, election_ref = ERef}.
 
 set_leader_uncertain(#st{agent = A} = S) ->
@@ -1109,3 +1148,8 @@ vector(Lock, {_Pending, Locks}) ->
 
 lock_holder(#lock{queue = [#w{entries = [#entry{agent = A}]}|_]}) ->
     A.
+
+-ifdef(LOCKS_DEBUG).
+dbg_log(X, #st{leader = L, vector = V}) ->
+    ?log(#{x => X, l => L, v => V}).
+-endif.

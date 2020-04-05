@@ -27,10 +27,10 @@ notify([], _, _) ->
 
 send(Pid, Msg) when is_pid(Pid) ->
     ?event({send, Pid, Msg}),
-    Pid ! Msg;
-send({Agent,_} = _A, Msg) when is_pid(Agent) ->
-    ?event({send, Agent, Msg}),
-    Agent ! Msg.
+    Pid ! Msg.
+%% send({Agent,_} = _A, Msg) when is_pid(Agent) ->
+%%     ?event({send, Agent, Msg}),
+%%     Agent ! Msg.
 
 %% In the case of agents waiting for lock upgrade, there may be
 %% more than one entry from a given agent. Since the agent performs

@@ -1,0 +1,8 @@
+%% -*- mode:erlang; erlang-indent-level:4; indent-tabs-mode:nil -*-
+case os:getenv("LOCKS_DEBUG") of
+    false ->
+        CONFIG;
+    S when S =/= "false" ->
+        io:fwrite("Enabling runtime debugging~n", []),
+        [{erl_opts, [{d,'LOCKS_DEBUG'}]} | CONFIG]
+end.
