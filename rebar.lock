@@ -1,0 +1,6 @@
+{"1.1.0",
+[{<<"plain_fsm">>,{pkg,<<"plain_fsm">>,<<"1.4.1">>},0}]}.
+[
+{pkg_hash,[
+ {<<"plain_fsm">>, <<"47E9BF6AC9322FC7586FB6DF8DE7198391E93764571C75165F2C45B27ACDE1D0">>}]}
+].

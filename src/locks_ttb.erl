@@ -1,6 +1,6 @@
 -module(locks_ttb).
 
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 
 %% This function is also traced. Can be used to insert markers in the trace
@@ -19,6 +19,7 @@ trace_nodes(Ns, Patterns, Flags, Opts) ->
 
 default_patterns() ->
     [{locks_agent , event, 3, []},
+     {locks_server, event, 3, []},
      {locks_leader, event, 3, []},
      {?MODULE     , event, 3, []}].
 

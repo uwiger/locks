@@ -149,7 +149,7 @@ merge_dicts(D, I) ->
     lists:foldl(
       fun({C, {true, D2}}, Acc) ->
 	      ?event({merge_got, C, D2}),
-	      dict:merge(fun(_K,V1,_) -> V1 end, Acc, D2);
+              maps:merge(Acc, D2);   %% our content takes priority
 	 ({C, false}, Acc) ->
 	      ?event({merge_got, C, false}),
 	      Acc

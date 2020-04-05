@@ -120,6 +120,7 @@
 	  %% mode = dynamic,
 	  initial = true,
 	  lock,
+          vector,
 	  agent,
 	  leader,
           election_ref,
@@ -595,13 +596,14 @@ handle_info({?MODULE, leader_uncertain, L, Synced, SyncedWs}, S) ->
     ?event({leader_uncertain, {{L, Synced, SyncedWs}, S#st.leader}}),
     case S#st.leader of
         MyL when MyL == self() ->
-            lists:foldl(
-              fun({Pid, Type}, Sx) ->
-                      maybe_announce_leader(
-                        Pid, Type, remove_synced(Pid, Type, Sx))
-              end, S,
-              [{P,candidate} || P <- [L|Synced]]
-              ++ [{P,worker} || P <- SyncedWs]);
+            noreply(
+              lists:foldl(
+                fun({Pid, Type}, Sx) ->
+                        maybe_announce_leader(
+                          Pid, Type, remove_synced(Pid, Type, Sx))
+                end, S,
+                [{P,candidate} || P <- [L|Synced]]
+                ++ [{P,worker} || P <- SyncedWs]));
         L ->
             locks_agent:change_flag(S#st.agent, notify, true),
             noreply(S#st{leader = undefined,
@@ -616,7 +618,7 @@ handle_info({?MODULE, ensure_sync, Pid, Type} = _Msg, #st{} = S) ->
     ?event(_Msg, S),
     S1 = case S#st.leader of
              Me when Me == self() ->
-                 maybe_announce_leader(Pid, Type, S);
+                 maybe_announce_leader(Pid, Type, remove_synced(Pid, Type, S));
              _ ->
                  S
          end,
@@ -813,12 +815,16 @@ monitor_cand(Client) ->
     put({?MODULE, monitor, MRef}, candidate).
 
 maybe_announce_leader(Pid, Type, #st{leader = L, mod = M,
-                                     mod_state = MSt} = S) ->
-    ?event({maybe_announce_leader, Pid, Type}, S),
-    ERef = S#st.election_ref,
-    IsSynced = is_synced(Pid, Type, S),
+                                     mod_state = MSt} = S0) ->
+    ?event({maybe_announce_leader, Pid, Type}, S0),
+    IsSynced = is_synced(Pid, Type, S0),
+    ?event({is_synced, Pid, IsSynced}),
     if L == self(), IsSynced == false ->
-	    case M:elected(MSt, opaque(S), Pid) of
+            S = refresh_vector(S0),
+            ERef = S#st.election_ref,
+	    ERes = M:elected(MSt, opaque(S), Pid),
+            ?event({elected_result, ERes}),
+            case ERes of
 		{reply, Msg, MSt1} ->
 		    Pid ! msg(am_leader, ERef, Msg),
                     mark_as_synced(Pid, Type, S#st{mod_state = MSt1});
@@ -841,7 +847,8 @@ maybe_announce_leader(Pid, Type, #st{leader = L, mod = M,
                     end
 	    end;
        true ->
-	    S
+            ?event({will_not_announce, L, IsSynced}),
+	    S0
     end.
 
 set_leader_undefined(#st{} = S) ->
@@ -876,18 +883,25 @@ maybe_remove_cand(worker, Pid, #st{workers = Ws} = S) ->
     S#st{workers = Ws -- [Pid]}.
 
 become_leader(#st{agent = A} = S) ->
-    {_, Locks} = locks_agent:lock_info(A),
-    S1 = lists:foldl(
+    {_, Locks} = LockInfo = locks_agent:lock_info(A),
+    S1 = refresh_vector(LockInfo, S),
+    S2 = lists:foldl(
            fun(#lock{object = {OID,Node}} = L, Sx) ->
                    lock_info(L#lock{object = OID}, Node, Sx)
-           end, S, Locks),
-    become_leader_(S1).
+           end, S1, Locks),
+    case S2#st.vector of
+        #{leader := Lv} when Lv =/= A ->
+            ?event(vector_questions_leader, S2),
+            set_leader_uncertain(S2);
+        _ ->
+            become_leader_(S2)
+    end.
 
-become_leader_(#st{election_ref = {L,_}, mod = M, mod_state = MSt,
+become_leader_(#st{election_ref = {L,_,_}, mod = M, mod_state = MSt,
                    candidates = Cands, synced = Synced,
                    workers = Ws, synced_workers = SyncedWs} = S0)
   when L =:= self() ->
-    S = S0#st{leader = self()},
+    S = S0#st{leader = self(), election_ref = new_election_ref(S0)},
     ?event(become_leader_again, S),
     send_all(S, {?MODULE, affirm_leader, self(), S#st.election_ref}),
     case {Cands -- Synced, Ws -- SyncedWs} of
@@ -909,7 +923,7 @@ become_leader_(#st{election_ref = {L,_}, mod = M, mod_state = MSt,
             end
     end;
 become_leader_(#st{mod = M, mod_state = MSt} = S0) ->
-    S = S0#st{election_ref = {self(),erlang:monotonic_time(microsecond)}},
+    S = S0#st{election_ref = new_election_ref(S0)},
     ?event(become_leader, S),
     case M:elected(MSt, opaque(S), undefined) of
 	{ok, Msg, MSt1} ->
@@ -919,6 +933,9 @@ become_leader_(#st{mod = M, mod_state = MSt} = S0) ->
 	{error, Reason} ->
 	    error(Reason)
     end.
+
+new_election_ref(#st{vector = V}) ->
+    {self(), erlang:monotonic_time(microsecond), V}.
 
 msg(from_leader, ERef, Msg) ->
     {?MODULE, from_leader, self(), ERef, Msg};
@@ -993,29 +1010,48 @@ do_broadcast_(Pids, Msg) when is_list(Pids) ->
 from_leader(L, ERef, Msg, #st{leader = L, election_ref = ERef,
                               mod = M, mod_state = MSt} = S) ->
     callback(M:from_leader(Msg, MSt, opaque(S)), S);
-from_leader(_OtherL, _ERef, _Msg, S) ->
-    ?event({ignoring_from_leader, _OtherL, _Msg}, S),
-    S.
+from_leader(OtherL, ERef, _Msg, S) ->
+    ?event({possible_leader_conflict, OtherL, _Msg}, S),
+    S1 = refresh_vector(S),
+    case S1#st.vector of
+        #{leader := Lv} when Lv =/= OtherL ->
+            set_leader_uncertain(S1);
+        _ ->
+            request_sync(OtherL, ERef, S)
+    end.
 
-leader_announced(L, ERef, Msg, #st{leader = L, election_ref = ERef,
+leader_announced(L, ERef, Msg, #st{election_ref = ERef,
                                    mod = M, mod_state = MSt} = S) ->
     callback(M:surrendered(MSt, Msg, opaque(S)),
-             S#st{synced = [], synced_workers = []});
+             S#st{leader = L, synced = [], synced_workers = []});
 leader_announced(L, ERef, Msg, #st{mod = M, mod_state = MSt} = S) ->
-    %% Ref = erlang:monitor(process, L),
-    %% put({?MODULE,monitor,Ref}, candidate),
-    S1 = S#st{leader = L, election_ref = ERef,
-              synced = [], synced_workers = []},
-    callback(M:surrendered(MSt, Msg, opaque(S1)), S1).
+    #st{vector = V} = S1 = refresh_vector(S),
+    {_,_,Vl} = ERef,
+    case Vl == V of
+        true ->
+            ?event({vectors_same, V}),
+            S2 = S1#st{leader = L, election_ref = ERef,
+                       synced = [], synced_workers = []},
+            callback(M:surrendered(MSt, Msg, opaque(S1)), S2);
+        false ->
+            ?event({vectors_differ, {Vl, V}}),
+            set_leader_uncertain(S1)
+    end.
 
-leader_affirmed(L, ERef, #st{election_ref = ERef} = S) ->
-    S#st{leader = L};
+leader_affirmed(L, ERef, #st{leader = L, election_ref = ERef} = S) ->
+    ?event({leader_affirmed_known, L, ERef}),
+    S;
 leader_affirmed(_L, _ERef, #st{leader = Me} = S) when Me == self() ->
+    ?event({leader_not_affirmed, _L, _ERef}),
     set_leader_uncertain(S);
-leader_affirmed(L, _ERef, #st{} = S) ->
-    %% don't set election_ref, since we are not yet synced
+leader_affirmed(L, ERef, #st{} = S) ->
+    %% don't set leader, since we are not yet synced (return to safe_loop)
+    ?event({ensuring_sync, L, S#st.role}),
+    request_sync(L, ERef, S).
+
+request_sync(L, ERef, S) ->
     L ! {?MODULE, ensure_sync, self(), S#st.role},
-    S#st{leader = L}.
+    S#st{leader = undefined, election_ref = ERef}.
 
 set_leader_uncertain(#st{agent = A} = S) ->
     send_all(S, {?MODULE, leader_uncertain, self(),
@@ -1043,3 +1079,33 @@ get_opt(K, Opts, Default) ->
 
 asynch_ping(N) ->
     rpc:cast(N, erlang, is_atom, [true]).
+
+refresh_vector(#st{agent = A} = S) ->
+    refresh_vector(locks_agent:lock_info(A), S).
+
+refresh_vector(LockInfo, #st{lock = L} = S) ->
+    maybe_refresh_eref(S#st{vector = vector(L, LockInfo)}).
+
+maybe_refresh_eref(#st{election_ref = {Me,_,Ve}, vector = V} = S)
+  when Me == self(),
+       Ve =/= V ->
+    S#st{election_ref = new_election_ref(S)};
+maybe_refresh_eref(S) ->
+    S.
+
+vector(Lock, {_Pending, Locks}) ->
+    %% As a matter of implementation, the list of locks happens to be ordered,
+    %% but this is not a documented fact.
+    NewVector = lists:sort(
+                  [{N, V} || #lock{object = {L, N}, version = V} <- Locks,
+                             L =:= Lock]),
+    case length(lists:usort([lock_holder(Lx) || Lx <- Locks])) == 1 of
+        true ->
+            Leader = lock_holder(hd(Locks)),
+            #{leader => Leader, vector => NewVector};
+        false ->
+            #{leader => none, vector => NewVector}
+    end.
+
+lock_holder(#lock{queue = [#w{entries = [#entry{agent = A}]}|_]}) ->
+    A.

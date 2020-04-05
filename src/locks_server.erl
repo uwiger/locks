@@ -15,7 +15,7 @@
 -behavior(gen_server).
 
 -export([lock/2, lock/3, lock/4,
-	 surrender/2, surrender/3,
+	 surrender/3, surrender/4,
 	 watch/2, unwatch/2,
 	 remove_agent/1, remove_agent/2]).
 
@@ -33,21 +33,8 @@
 
 -export([record_fields/1]).
 
--define(event(E), event(?LINE, E, none)).
--define(event(E, S), event(?LINE, E, S)).
-
 -include("locks.hrl").
-
--define(LOCKS, locks_server_locks).
--define(AGENTS, locks_server_agents).
-
--record(st, {tabs = {ets:new(?LOCKS, [public, named_table,
-                                      ordered_set, {keypos, 2}]),
-		     ets:new(?AGENTS, [public, named_table, ordered_set])},
-	     monitors = dict:new(),
-	     notify_as = self()}).
-
--record(surr, {id, mode, type, client, vsn, lock}).
+-include("locks_server.hrl").
 
 record_fields(st) ->
     record_info(fields, st);
@@ -109,14 +96,14 @@ unwatch(LockID, Nodes) ->
     _ = [cast({?LOCKER, N}, Msg) || N <- Nodes],
     ok.
 
-surrender(LockID, Node) ->
-    surrender_(LockID, Node, self()).
+surrender(LockID, Node, Vsn) ->
+    surrender_(LockID, Node, Vsn, self()).
 
-surrender(LockID, Node, TID) ->
-    surrender_(LockID, Node, {self(), TID}).
+surrender(LockID, Node, Vsn, TID) ->
+    surrender_(LockID, Node, Vsn, {self(), TID}).
 
-surrender_(LockID, Node, Agent) ->
-    cast({?LOCKER, Node}, {surrender, LockID, Agent}).
+surrender_(LockID, Node, Vsn, Agent) ->
+    cast({?LOCKER, Node}, {surrender, LockID, Vsn, Agent}).
 
 remove_agent(Nodes) when is_list(Nodes) ->
     [cast({?LOCKER, N}, {remove_agent, self()}) || N <- Nodes],
@@ -140,10 +127,11 @@ handle_cast({lock, LockID, Agent, Client, Mode} = _Msg, #st{tabs = Tabs} = S) ->
     ?event({updated, Updated}),
     notify(Updated, S#st.notify_as),
     {noreply, monitor_agent(Agent, S)};
-handle_cast({surrender, LockID, Agent} = _Msg, #st{tabs = Tabs} = S) ->
+handle_cast({surrender, LockID, Vsn, Agent} = _Msg, #st{tabs = Tabs} = S) ->
     ?event({handle_cast, _Msg}),
-    Updated = do_surrender(LockID, Agent, Tabs),
-    notify(Updated, S#st.notify_as, {surrender, Agent}),
+    Updated = do_surrender(LockID, Vsn, Agent, Tabs),
+    ?event({updated, Updated}),
+    notify(Updated, S#st.notify_as, {surrender, Agent, Vsn}),
     {noreply, S};
 handle_cast({remove_agent, Agent} = _Msg, #st{tabs = Tabs} = S) ->
     ?event({handle_cast, _Msg}),
@@ -188,41 +176,16 @@ code_change(_FromVsn, S, _Extra) ->
 
 %% ==== End Server callbacks =================================
 
-notify(Locks, Me) ->
-    notify(Locks, Me, []).
+notify(Locks, As) ->
+    locks_server_lib:notify(Locks, As, []).
 
-notify([#lock{queue = Q, watchers = W} = H|T], Me, Note) ->
-    ?event({notify, Q, W}),
-    Msg = #locks_info{lock = H, note = Note},
-    _ = [send(A, Msg) || #entry{agent = A} <- queue_entries(Q)],
-    _ = [send(P, Msg) || P <- W],
-    notify(T, Me, Note);
-notify([], _, _) ->
-    ok.
+notify(Locks, As, Note) ->
+    locks_server_lib:notify(Locks, As, Note).
 
-send(Pid, Msg) when is_pid(Pid) ->
-    ?event({send, Pid, Msg}),
-    Pid ! Msg;
-send({Agent,_} = _A, Msg) when is_pid(Agent) ->
-    ?event({send, Agent, Msg}),
-    Agent ! Msg.
-
-queue_entries(Q) ->
-    Res = queue_entries_(Q),
-    ?event({queue_entries, Q, Res}),
-    Res.
-
-queue_entries_([#r{entries = Es}|Q]) ->
-    Es ++ queue_entries_(Q);
-queue_entries_([#w{entries = Es}|Q]) ->
-    Es ++ queue_entries_(Q);
-queue_entries_([]) ->
-    [].
-
-insert(ID, Agent, Client, Mode, {Locks, Tids})
+insert(ID, Agent, Client, Mode, {Locks, Tids, Admin})
   when is_list(ID), Mode==read; Mode==write ->
     Related = related_locks(ID, Locks),
-    NewVsn = new_vsn(Related),
+    NewVsn = new_vsn(Admin),
     {Check, Result} = insert_agent(Related, ID, Agent, Client, Mode, NewVsn),
     ?event({insert_agent, ID, Agent, {Check, Result}}),
     ets_insert(Tids, [{{Agent,ID1}} || #lock{object = ID1} <- Result]),
@@ -230,7 +193,7 @@ insert(ID, Agent, Client, Mode, {Locks, Tids})
     ets_insert(Locks, Result),
     Result.
 
-insert_watcher(ID, Pid, {Locks, Tids}) ->
+insert_watcher(ID, Pid, {Locks, Tids, _Admin}) ->
     case ets_lookup(Locks, ID) of
 	[#lock{queue = Q, watchers = Ws} = L] ->
 	    L1 = L#lock{watchers = [Pid | Ws -- [Pid]]},
@@ -245,7 +208,7 @@ insert_watcher(ID, Pid, {Locks, Tids}) ->
     end,
     ets_insert(Tids, {{Pid, ID}}).
 
-delete_watcher(ID, Pid, {Locks, Tids}) ->
+delete_watcher(ID, Pid, {Locks, Tids, _Admin}) ->
     case ets_lookup(Locks, ID) of
 	[#lock{watchers = Ws} = L] ->
 	    ets_insert(Locks, L#lock{watchers = Ws -- [Pid]}),
@@ -310,21 +273,33 @@ fold_queue(_, Acc, []) ->
 %% 5. Remove agent A from all locks in the found groups.
 %% 6. Re-apply the direct locks.
 %% 7. Increment versions of updated locks.
-do_surrender(ID, A, {Locks, Agents}) ->
-    Related = related_locks(ID, A, Agents, Locks),
+do_surrender(ID, Vsn, A, {Locks, Agents, Admin}) ->
+    case find_lock(Locks, ID) of
+        {ok, #lock{version = Vsn}} ->
+            do_surrender(related_locks(ID, A, Agents, Locks),
+                         ID, A, Locks, Agents, Admin);
+        Other ->
+            ?event({lock_not_found_or_wrong_vsn, ID, Other}),
+            []
+    end.
+
+do_surrender([], _, _, _, _, _) ->
+    %% Found no locks matching the parameters
+    [];
+do_surrender([_|_] = Related, ID, A, Locks, Agents, Admin) ->
+    ?event({related_locks, Related}),
     Groups = group_related(Related, A),
     AffectedGroups = affected_groups(Groups, ID),  % list of lists
     Reapply = [hd(G) || G <- AffectedGroups],
     AllLocks = lists:ukeysort(#surr.id, lists:append(AffectedGroups)),
+    NewVsn = new_vsn(Admin),
     AllLocks1 =
-        [remove_agent_from_lock(A, S#surr.lock) || S <- AllLocks],
+        [remove_agent_from_lock(A, S#surr.lock, NewVsn) || S <- AllLocks],
     {Check, Updated} =
         lists:foldl(
-          fun(#surr{id = L, mode = Mode,
-                    client = Client,
-                    lock = #lock{version = V}}, {Chk, Acc}) ->
+          fun(#surr{id = L, mode = Mode, client = Client}, {Chk, Acc}) ->
                   {Check, Upd} =
-                      insert_agent(Acc, L, A, Client, Mode, V),
+                      insert_agent(Acc, L, A, Client, Mode, NewVsn),
                   {Check orelse Chk,
                    lists:foldl(fun(Lock, Acc2) ->
                                        lists:keyreplace(
@@ -388,107 +363,44 @@ affected_groups(Groups, ID) ->
 
 process_updated([#lock{object = ID,
                        queue = [],
-                       watchers = Ws,
-                       version = V} = H|T], A, Locks, Agents) ->
+                       watchers = Ws} = H|T], A, Locks, Agents) ->
     ets_delete(Agents, {A, ID}),
     if Ws =:= [] ->
             ets_delete(Locks, ID),
             process_updated(T, A, Locks, Agents);
        true ->
-            H1 = H#lock{version = V+1},
-            ets_insert(Locks, H1),
-            [H1 | process_updated(T, A, Locks, Agents)]
+            ets_insert(Locks, H),
+            [H | process_updated(T, A, Locks, Agents)]
     end;
-process_updated([#lock{version = V} = H|T], A, Locks, Agents) ->
-    H1 = H#lock{version = V+1},
-    ets_insert(Locks, H1),
-    [H1 | process_updated(T, A, Locks, Agents)];
+process_updated([H|T], A, Locks, Agents) ->
+    ets:insert(Locks, H),
+    [H | process_updated(T, A, Locks, Agents)];
 process_updated([], _, _, _) ->
     [].
 
-do_remove_agent(A, {Locks, Agents}) ->
-    Found = ets_select(Agents, [{ {{A,'$1'}}, [], [{{A,'$1'}}] }]),
-    ?event([{removing_agent, A}, {found, Found}]),
-    ets:select_delete(Agents, [{ {{A,'_'}}, [], [true] }]),
-    do_remove_agent_(Found, Locks, []).
+do_remove_agent(A, Tabs) ->
+    locks_server_lib:remove_agent(A, Tabs).
 
 monitor_agent(A, #st{monitors = Mons} = S) when is_pid(A) ->
-    case dict:find(A, Mons) of
-	{ok, _} ->
+    case maps:is_key(A, Mons) of
+        true ->
 	    S;
-	error ->
+        false ->
 	    Ref = erlang:monitor(process, A),
-	    S#st{monitors = dict:store(A, Ref, Mons)}
+	    S#st{monitors = Mons#{A => Ref}}
     end.
 
 demonitor_agent(A, #st{monitors = Mons} = S) when is_pid(A) ->
-    case dict:find(A, Mons) of
+    case maps:find(A, Mons) of
 	{ok, Ref} ->
 	    erlang:demonitor(Ref),
-	    S#st{monitors = dict:erase(A, Mons)};
+	    S#st{monitors = maps:remove(A, Mons)};
 	error ->
 	    S
     end.
 
-
-do_remove_agent_([{A, ID}|T], Locks, Acc) ->
-    case ets_lookup(Locks, ID) of
-	[] ->
-	    do_remove_agent_(T, Locks, Acc);
-	[#lock{} = L] ->
-            case remove_agent_from_lock(A, L) of
-                #lock{queue = [], watchers = []} ->
-                    ets_delete(Locks, ID),
-                    do_remove_agent_(T, Locks, Acc);
-                #lock{} = L1 ->
-                    do_remove_agent_(T, Locks, [L1|Acc])
-            end
-    end;
-do_remove_agent_([], Locks, Acc) ->
-    ets_insert(Locks, [L || #lock{queue = Q,
-				  watchers = Ws} = L <- Acc,
-			    Q =/= [] orelse Ws =/= []]),
-    Acc.
-
-remove_agent_from_lock(A, #lock{version = V, queue = Q, watchers = Ws} = L) ->
-    Q1 = trivial_lock_upgrade(
-           lists:foldr(
-             fun(#r{entries = [#entry{agent = Ax}]}, Acc1) when Ax == A ->
-                     Acc1;
-                (#r{entries = Es}, Acc1) ->
-                     case lists:keydelete(A, #entry.agent, Es) of
-                         [] -> Acc1;
-                         Es1 ->
-                             [#r{entries = Es1} | Acc1]
-                     end;
-                (#w{entries = Es}, Acc1) ->
-                     case lists:keydelete(A, #entry.agent, Es) of
-                         [] -> Acc1;
-                         Es1 ->
-                             [#w{entries = Es1} | Acc1]
-                     end;
-                (E, Acc1) ->
-                     [E|Acc1]
-             end, [], Q)),
-    L#lock{version = V+1, queue = Q1,
-           watchers = Ws -- [A]}.
-
-trivial_lock_upgrade([#r{entries = [#entry{agent = A}]} |
-                      [#w{entries = [#entry{agent = A}]} | _] = T]) ->
-    T;
-trivial_lock_upgrade([#r{entries = Es}|[_|_] = T] = Q) ->
-    %% Not so trivial, perhaps
-    case lists:all(fun(#entry{agent = A}) ->
-                           in_queue(T, A, write)
-                   end, Es) of
-        true ->
-            %% All agents holding the read lock are also waiting for an upgrade
-            trivial_lock_upgrade(T);
-        false ->
-            Q
-    end;
-trivial_lock_upgrade(Q) ->
-    Q.
+remove_agent_from_lock(Agent, Lock, NewVsn) ->
+    locks_server_lib:remove_agent_from_lock(Agent, Lock, NewVsn).
 
 related_locks(ID, A, Agents, Locks) ->
     Pats = agent_patterns(ID, A, []),
@@ -527,29 +439,19 @@ get_lock(T, Id) ->
     [L] = ets_lookup(T, Id),
     L.
 
+find_lock(T, Id) ->
+    case ets_lookup(T, Id) of
+        [] ->
+            error;
+        [L] ->
+            {ok, L}
+    end.
+
 related_locks(ID, T) ->
-    Pats = make_patterns(ID),
-    ets_select(T, Pats).
+    locks_server_lib:related_locks(ID, T).
 
-make_patterns(ID) ->
-    make_patterns(ID, []).
-
-make_patterns([H|T], Acc) ->
-    ID = Acc ++ [H],
-    [{ #lock{object = ID, _ = '_'}, [], ['$_'] }
-     | make_patterns(T, ID)];
-make_patterns([], Acc) ->
-    [{ #lock{object = Acc ++ '_', _ = '_'}, [], ['$_'] }].
-
-
-new_vsn(Locks) ->
-    Current =
-	lists:foldl(
-	  fun(#lock{version = V}, Acc) ->
-		  erlang:max(V, Acc)
-	  end, 0, Locks),
-    Current + 1.
-
+new_vsn(Tab) ->
+    locks_server_lib:new_vsn(Tab).
 
 insert_agent([], ID, A, Client, Mode, Vsn) ->
     %% No related locks; easy case.
@@ -606,94 +508,11 @@ insert_agent([_|_] = Related, ID, A, Client, Mode, Vsn) ->
 	    end
     end.
 
-in_queue([H|T], A, Mode) ->
-    case in_queue_(H, A, Mode) of
-	false -> in_queue(T, A, Mode);
-	true  -> true
-    end;
-in_queue([], _, _) ->
-    false.
+in_queue(Q, A, Mode) ->
+    locks_server_lib:in_queue(Q, A, Mode).
 
-in_queue_(#r{entries = Entries}, A, read) ->
-    lists:keymember(A, #entry.agent, Entries);
-in_queue_(#w{entries = Es}, A, M) when M==read; M==write ->
-    lists:keymember(A, #entry.agent, Es);
-in_queue_(_, _, _) ->
-    false.
-
-into_queue(read, [#r{entries = Entries}] = Q, Entry) ->
-    %% No pending write locks
-    case lists:keymember(Entry#entry.agent, #entry.agent, Entries) of
-	true -> Q;
-	false ->
-	    [#r{entries = [Entry|Entries]}]
-    end;
-into_queue(read,  [], Entry) ->
-    [#r{entries = [Entry]}];
-into_queue(write, [], Entry) ->
-    [#w{entries = [Entry]}];
-into_queue(write, [#r{entries = [Er]} = H], Entry) ->
-    if Entry#entry.agent == Er#entry.agent ->
-	    %% upgrade to write lock
-	    [#w{entries = [Entry]}];
-       true ->
-	    [H, #w{entries = [Entry]}]
-    end;
-into_queue(write, [#w{entries = [#entry{agent = A}]}],
-           #entry{agent = A, type = direct} = Entry) ->
-    %% Refresh and ensure it's a direct lock
-    [#w{entries = [Entry]}];
-into_queue(Type, [H|T], #entry{agent = A, type = direct} = Entry) ->
-    case H of
-        #w{entries = [_,_|_]} ->
-            %% This means that there are multiple exclusive write locks at
-            %% a lower level; they can co-exist, but neither has an exclusive
-            %% claim at this level. Queue request
-            [H | into_queue(Type, T, Entry)];
-        #w{entries = Es} when Type == write; Type == read ->
-            %% If a matching entry exists, we set to new version and
-            %% set type to direct. This means we might get a direct write
-            %% lock even though we asked for a read lock.
-            maybe_refresh(Es, H, T, Type, A, Entry);
-        #r{entries = Es} when Type == read ->
-            maybe_refresh(Es, H, T, Type, A, Entry);
-        #r{entries = Es} when Type == write ->
-            %% A special case is when all agents holding read entries have
-            %% asked for an upgrade.
-            case lists:all(fun(#entry{agent = A1}) when A1 == A -> true;
-                              (#entry{agent = A1}) -> in_queue(T, A1, write)
-                           end, Es) of
-                true ->
-                    %% discard all read entries
-                    into_queue(write, T, Entry);
-                false ->
-                    [H | into_queue(Type, T, Entry)]
-            end;
-        _ ->
-            [H | into_queue(Type, T, Entry)]
-    end;
-into_queue(Type, [H|T] = Q, Entry) ->
-    case in_queue_(H, Entry#entry.agent, Type) of
-	false ->
-	    [H|into_queue(Type, T, Entry)];
-	true ->
-	    Q
-    end.
-
-maybe_refresh(Es, H, T, Type, A, Entry) ->
-    case lists:keyfind(A, #entry.agent, Es) of
-        #entry{} = E ->
-            Es1 = lists:keyreplace(A, #entry.agent, Es,
-                                   E#entry{type = Entry#entry.type,
-                                           version = Entry#entry.version}),
-            case H of
-                #w{} -> [H#w{entries = Es1} | T];
-                #r{} -> [H#r{entries = Es1} | T]
-            end;
-        false ->
-            [H | into_queue(Type, T, Entry)]
-    end.
-
+into_queue(Mode, Q, Entry) ->
+    locks_server_lib:into_queue(Mode, Q, Entry).
 
 append_entry([#lock{queue = Q} = H|T], Entry, Mode, Vsn) ->
     [H#lock{version = Vsn, queue = into_queue(Mode, Q, Entry)}
@@ -791,75 +610,8 @@ upgrade_entries([#entry{agent = A, version = Vsn} = E|Esr], Esw, Accr) ->
             upgrade_entries(Esr, Esw, [E|Accr])
     end.
 
-split_related(Related, ID) ->
-    case length(ID) of
-	1 ->
-	    case Related of
-		[#lock{object = [_]} = Mine|Ch] -> {[], Mine, Ch};
-		Ch -> {[], [], Ch}
-	    end;
-	2 -> split2(Related, ID);
-	3 -> split3(Related, ID);
-	4 -> split4(Related, ID);
-	L -> split(Related, L, ID)
-    end.
-
-%%% =====
-
-%% Generic split, will call length/1 on each ID
-split(Locks, Len, ID) ->
-    {Parents, Locks1} = split_ps(Locks, Len, []),
-    split_(Locks1, ID, Parents).
-
-split_ps([#lock{object = I}=H|T], Len, Acc) when length(I) < Len ->
-    split_ps(T, Len, [H|Acc]);
-split_ps(L, _, Acc) ->
-    {lists:reverse(Acc), L}.
-
-split_([#lock{object = ID} = Mine|Ch], ID, Parents) ->
-    {Parents, Mine, Ch};
-split_(Ch, ID, Parents) ->
-    {Parents, #lock{object = ID}, Ch}.
-
-%% Optimized split for ID length 2
-split2([#lock{object = [_]} = H|T], ID) -> split2(T, [H], ID);
-split2(L, ID) -> split2(L, [], ID).
-
-split2([#lock{object = ID} = Mine|Ch], Ps, ID) -> {Ps, Mine, Ch};
-split2(Ch, Ps, _ID) -> {Ps, [], Ch}.
-
-%% Optimized split for ID length 3
-split3(L, ID) ->
-    case L of
-	[#lock{object = [_]} = P1, #lock{object = [_,_]} = P2|T] ->
-	    split3(T, [P1,P2], ID);
-	[#lock{object = [_]} = P1|T] ->
-	    split3(T, [P1], ID);
-	[#lock{object = [_,_]} = P2|T] ->
-	    split3(T, [P2], ID);
-	[#lock{object = ID} = Mine|T] ->
-	    {[], Mine, T};
-	[_|_] ->
-	    {[], [], L}
-    end.
-
-split3([#lock{object = ID} = Mine|Ch], Ps, ID) -> {Ps, Mine, Ch};
-split3(Ch, Ps, _ID) -> {Ps, [], Ch}.
-
-split4(L, ID) ->
-    {Ps, L1} = split4_ps(L, []),
-    split4(L1, Ps, ID).
-
-split4_ps([#lock{object = [_]} = H|T], Acc) -> split4_ps(T, [H|Acc]);
-split4_ps([#lock{object = [_,_]} = H|T], Acc) -> split4_ps(T, [H|Acc]);
-split4_ps([#lock{object = [_,_,_]} = H|T], Acc) -> split4_ps(T, [H|Acc]);
-split4_ps(L, Acc) -> {lists:reverse(Acc), L}.
-
-split4([#lock{object = [_,_,_,_]} = Mine|Ch], Ps, _) -> {Ps, Mine, Ch};
-split4(Ch, Ps, _ID) -> {Ps, [], Ch}.
-
-event(_Line, _Msg, _St) ->
-    ok.
+split_related(Related, Id) ->
+    locks_server_lib:split_related(Related, Id).
 
 ets_insert(T, Data) -> ets:insert(T, Data).
 ets_lookup(T, K)    -> ets:lookup(T, K).
