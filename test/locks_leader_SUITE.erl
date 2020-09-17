@@ -73,7 +73,6 @@ suite() ->
     [].
 
 init_per_suite(Config) ->
-    compile_dict(),
     application:start(sasl),
     Config.
 
@@ -139,7 +138,13 @@ end_per_testcase(_Case, _Config) ->
 %% Test cases
 %% ============================================================
 
-local_dict(_Config) ->
+local_dict(Config) ->
+    with_trace(fun local_dict_/1, Config, "leader_test_local_dict").
+
+local_dict_(_Config) ->
+    dbg:tracer(),
+    dbg:tpl(locks_leader, x),
+    dbg:p(all,[c]),
     Name = {gdict, ?LINE},
     Dicts = lists:map(
               fun(_) ->
@@ -191,20 +196,20 @@ gdict_simple_netsplit_(Config) ->
     Dicts = lists:map(fun({ok,D}) -> D end, Results),
     wait_for_dicts(Dicts),
     [X, X] = [locks_leader:info(Dx, leader) || Dx <- Dicts],
-    locks_ttb:event(initial_consensus),
+    locks_ttb:event({?LINE, initial_consensus}),
     call_proxy(A, erlang, disconnect_node, [B]),
     [] = call_proxy(A, erlang, nodes, []),
     [] = call_proxy(B, erlang, nodes, []),
-    locks_ttb:event(netsplit_ready),
+    locks_ttb:event({?LINE, netsplit_ready}),
     wait_for_dicts(Dicts),
     [L1,L2] = [locks_leader:info(Dx, leader) || Dx <- Dicts],
     true = (L1 =/= L2),
-    locks_ttb:event(reconnecting),
+    locks_ttb:event({?LINE, reconnecting}),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
     proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
     [B] = call_proxy(A, erlang, nodes, []),
     [Z,Z] = ?retry([Z,Z], call_proxy(A, ?MODULE, leader_nodes, [Dicts])),
-    locks_ttb:event({leader_consensus, Ns, Z}),
+    locks_ttb:event({?LINE, leader_consensus, Ns, Z}),
     proxy_multicall(Ns, application, stop, [locks]),
     ok.
 
@@ -222,35 +227,35 @@ gdict_netsplit_(Config) ->
     proxy_multicall([A,B], ?MODULE, disconnect_nodes, [Rest]),
     [B] = call_proxy(A, erlang, nodes, []),
     [A] = call_proxy(B, erlang, nodes, []),
-    locks_ttb:event(netsplit_ready),
+    locks_ttb:event({?LINE, netsplit_ready}),
     ok = lists:foreach(
            fun(ok) -> ok end,
            proxy_multicall(Ns, application, start, [locks])),
     Results = proxy_multicall(Ns, gdict, new_opt, [[{resource, Name}]]),
     [Da,Db|[Dc|_] = DRest] = Dicts = lists:map(fun({ok,Dx}) -> Dx end, Results),
-    locks_ttb:event({dicts_created, lists:zip(Ns, Dicts)}),
+    locks_ttb:event({?LINE, dicts_created, lists:zip(Ns, Dicts)}),
     ok = ?retry(ok, gdict:store(a, 1, Da)),
     ok = gdict:store(b, 2, Dc),
     {ok, 1} = ?retry({ok,1}, gdict:find(a, Db)),
     error = gdict:find(a, Dc),
     [X,X] = [locks_leader:info(Dx, leader) || Dx <- [Da,Db]],
-    locks_ttb:event({leader_consensus, [Da,Db], X}),
+    locks_ttb:event({?LINE, leader_consensus, [Da,Db], X}),
     RestLeaders = [locks_leader:info(Dx, leader) || Dx <- DRest],
     [Y] = lists:usort(RestLeaders),
-    locks_ttb:event({leader_consensus, DRest, Y}),
+    locks_ttb:event({?LINE, leader_consensus, DRest, Y}),
     true = (X =/= Y),
     lists:foreach(
       fun(Dx) ->
               {ok, 2} = ?retry({ok,2}, gdict:find(b, Dx))
       end, DRest),
     error = gdict:find(b, Da),
-    locks_ttb:event(reconnecting),
+    locks_ttb:event({?LINE, reconnecting}),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
     proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
     [B,C|_] = lists:sort(call_proxy(A, erlang, nodes, [])),
     [Z] = ?retry([_],
                 lists:usort(call_proxy(A, ?MODULE, leader_nodes, [Dicts]))),
-    locks_ttb:event({leader_consensus, Ns, Z}),
+    locks_ttb:event({?LINE, leader_consensus, Ns, Z}),
     {ok, 1} = ?retry({ok,1}, gdict:find(a, Dc)),
     {ok, 2} = ?retry({ok,2}, gdict:find(b, Da)),
     [exit(Dx, kill) || Dx <- Dicts],
@@ -311,18 +316,13 @@ with_trace(F, Config, Name) ->
 
 ttb_stop() ->
     Dir = locks_ttb:stop(),
+    ct:log("Dir = ~p", [Dir]),
     Out = filename:join(filename:dirname(Dir),
                         filename:basename(Dir) ++ ".txt"),
+    ct:log("Out = ~p", [Out]),
     locks_ttb:format(Dir, Out),
     ct:log("Formatted trace log in ~s~n", [Out]).
 
-
-compile_dict() ->
-    Lib = filename:absname(code:lib_dir(locks)),
-    Examples = filename:join(Lib, "examples"),
-    _ = os:cmd(["cd ", Examples, " && rebar clean compile"]),
-    _ = code:add_path(filename:join(Examples, "ebin")),
-    ok.
 
 maybe_connect(_, []) ->
     ok;
@@ -399,7 +399,7 @@ call_proxy(N, M, F, A) ->
     end.
 
 get_slave_nodes(Config) ->
-    [N || {N,_} <- ?config(slaves, Config)].
+    [N || {N,_} <- proplists:get_value(slaves, Config, [])].
 
 start_slaves(Ns) ->
     Nodes = [start_slave(N) || N <- Ns],
@@ -473,7 +473,7 @@ patch_net_kernel() ->
     {ok,net_kernel,Bin} = compile:forms(NewForms, [binary]),
     code:unstick_dir(filename:dirname(NetKernel)),
     {module, _Module} = Res = code:load_binary(net_kernel, NetKernel, Bin),
-    locks_ttb:event({net_kernel, NewForms}),
+    locks_ttb:event({?LINE, net_kernel, NewForms}),
     Res
     catch
         error:What ->

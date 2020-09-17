@@ -3,3 +3,6 @@ deps
 *.o
 *.beam
 *.plt
+_build
+.rebar3
+*.[eh]rl~
