@@ -58,6 +58,7 @@
 
 -import(lists,[foreach/2,any/2,map/2,member/2]).
 
+-include("locks_trace.hrl").
 -include("locks_agent.hrl").
 
 -ifdef(DEBUG).
@@ -173,12 +174,11 @@ agent_init(Wait, Client, Options) ->
         {ok, St} ->
             ack(Wait, Client, {ok, self()}),
             try loop(St)
-            catch
-                error:Error ->
+            ?_catch_(error, Error, ST)
                     error_logger:error_report(
                       [{?MODULE, aborted},
                        {reason, Error},
-                       {trace, erlang:get_stacktrace()}]),
+                       {trace, ST}]),
                     error(Error)
             end
         %% Other ->

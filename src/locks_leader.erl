@@ -135,13 +135,14 @@
 	  mod_state,
 	  buffered = []}).
 
+-include("locks_trace.hrl").
 -include("locks.hrl").
 -include("locks_debug.hrl").
 
 -ifdef(LOCKS_DEBUG).
 -define(log(X, S), dbg_log(X, S)).
 -else.
--define(log(X, S), ok).
+-define(log(X, S), ?event(X, S)).
 -endif.
 
 -define(event(E), event(?LINE, E, none)).
@@ -460,9 +461,8 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		{ok, MSt} -> MSt;
 		{error, Reason} ->
 		    abort_init(Reason, Parent)
-	    catch
-		error:Error ->
-		    abort_init({Error, erlang:get_stacktrace()}, Parent)
+	    ?_catch_(error, Error, ST)
+		    abort_init({Error, ST}, Parent)
 	    end,
     AllNodes = ordsets:from_list([node()|nodes()]),
     Agent =
@@ -565,10 +565,10 @@ safe_loop(#st{agent = A} = S) ->
             ?log(_Msg, S),
             ?event({in_safe_loop, _Msg}, S),
             noreply(leader_affirmed(L, Ref, S));
-        {?MODULE, ensure_sync, _, _} = _Msg ->
+        {?MODULE, ensure_sync, L, Type, ERef} = _Msg ->
             ?log(_Msg, S),
             ?event({in_safe_loop, _Msg}, S),
-            noreply(S);
+            noreply(sync_requested(L, Type, ERef, S));
         {'$gen_call', From, '$locks_leader_debug'} = _Msg ->
             ?log(_Msg, S),
             handle_call('$locks_leader_debug', From, S);
@@ -641,11 +641,11 @@ handle_info_({?MODULE, leader_uncertain, L, Synced, SyncedWs}, S) ->
 handle_info_({?MODULE, affirm_leader, L, ERef} = _Msg, #st{} = S) ->
     ?event(_Msg, S),
     noreply(leader_affirmed(L, ERef, S));
-handle_info_({?MODULE, ensure_sync, Pid, Type} = _Msg, #st{} = S) ->
+handle_info_({?MODULE, ensure_sync, Pid, Type, _ERef} = _Msg, #st{} = S) ->
     ?event(_Msg, S),
     S1 = case S#st.leader of
              Me when Me == self() ->
-                 maybe_announce_leader(Pid, Type, remove_synced(Pid, Type, S));
+                 do_ensure_sync(Pid, Type, S);
              _ ->
                  S
          end,
@@ -832,6 +832,7 @@ add_cand(Client, S) when Client == self() ->
 add_cand(Client, #st{candidates = Cands, role = Role} = S) ->
     case lists:member(Client, Cands) of
 	false ->
+            ?event({add_cand, Client}),
             monitor_cand(Client),
             S1 = S#st{candidates = [Client | Cands]},
 	    if Role == worker ->
@@ -1089,8 +1090,27 @@ leader_affirmed(L, ERef, #st{} = S) ->
     request_sync(L, ERef, S).
 
 request_sync(L, ERef, S) ->
-    snd(L, {?MODULE, ensure_sync, self(), S#st.role}),
+    snd(L, {?MODULE, ensure_sync, self(), S#st.role, ERef}),
     S#st{leader = undefined, election_ref = ERef}.
+
+sync_requested(Pid, Type, ERef, #st{ leader = undefined
+                                   , election_ref = ERef
+                                   , vector = #{leader := Me}
+                                   , agent = A } = S)
+  when Me == self() ->
+    %% We were uncertain about whether we're leader, but this is
+    %% affirmation from at least one other candidate.
+    case locks_agent:transaction_status(A) of
+        {have_all_locks, _} ->
+            do_ensure_sync(Pid, Type, S#st{leader = self()});
+        _ ->
+            S
+    end;
+sync_requested(_, _, _, S) ->
+    S.
+
+do_ensure_sync(Pid, Type, S) ->
+    maybe_announce_leader(Pid, Type, remove_synced(Pid, Type, S)).
 
 set_leader_uncertain(#st{agent = A} = S) ->
     send_all(S, {?MODULE, leader_uncertain, self(),
@@ -1151,5 +1171,6 @@ lock_holder(#lock{queue = [#w{entries = [#entry{agent = A}]}|_]}) ->
 
 -ifdef(LOCKS_DEBUG).
 dbg_log(X, #st{leader = L, vector = V}) ->
+    ?event(X, S),
     ?log(#{x => X, l => L, v => V}).
 -endif.
