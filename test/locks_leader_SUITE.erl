@@ -16,7 +16,8 @@
     gdict_simple_netsplit/1,
     gdict_all_nodes/1,
     gdict_netsplit/1,
-    start_incremental/1
+    start_incremental/1,
+    random_netsplits/1
    ]).
 
 -export([patch_net_kernel/0,
@@ -24,7 +25,8 @@
          connect_nodes/1,
          disconnect_nodes/1,
          unbar_nodes/0,
-         leader_nodes/1]).
+         leader_nodes/1,
+         same_leaders/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -define(retry_not(Res, Expr), retry(fun() ->
@@ -49,7 +51,8 @@ all() ->
      {group, g_2i},
      {group, g_3i},
      {group, g_4i},
-     {group, g_5i}
+     {group, g_5i},
+     {group, random_netsplits}
     ].
 
 groups() ->
@@ -66,7 +69,8 @@ groups() ->
      {g_2i, [], [start_incremental]},
      {g_3i, [], [start_incremental]},
      {g_4i, [], [start_incremental]},
-     {g_5i, [], [start_incremental]}
+     {g_5i, [], [start_incremental]},
+     {random_netsplits, [], [random_netsplits]}
     ].
 
 suite() ->
@@ -114,11 +118,16 @@ init_per_group(g_4i, Config) ->
 init_per_group(g_5i, Config) ->
     application:start(locks),
     Ns = start_slaves(node_list(5)),
+    [{slaves, Ns}|Config];
+init_per_group(random_netsplits, Config) ->
+    application:start(locks),
+    Ns = start_slaves(node_list(10)),
     [{slaves, Ns}|Config].
 
 end_per_group(g_local, _Config) ->
     application:stop(locks);
 end_per_group(_Group, Config) ->
+    application:stop(locks),
     stop_slaves(?config(slaves, Config)),
     ok.
 
@@ -290,6 +299,125 @@ start_incremental(N, Alive, Rest, Name) ->
     ct:log("Leaders = ~p~n", [Leaders]),
     start_incremental(Rest, NewAlive, Name).
 
+random_netsplits(Config) ->
+    with_trace(fun random_netsplits_/1, Config, "random_netsplits").
+
+random_netsplits_(Config) ->
+    DName = [?MODULE, ?LINE],
+    Slaves = get_slave_nodes(Config),
+    ct:log("Slaves = ~p", [Slaves]),
+    St0 = #{ islands => []
+           , idle    => Slaves
+           , dict    => DName },
+    do_random_splits(St0, Config, 1000),
+    ok.
+
+do_random_splits(St, Config, N) when N > 0 ->
+    case next_cmd(St) of
+        stop ->
+            ok;
+        {Cmd, Args} ->
+            St1 = perform(Cmd, Args, St),
+            do_random_splits(St1, Config, N-1)
+    end;
+do_random_splits(_, _, _) ->
+    ok.
+
+perform(split, {I, A, B} = Arg, #{ islands := Isls } = St) ->
+    locks_ttb:event({?LINE, split, Arg}),
+    ANodes = [N || {N,_} <- A],
+    BNodes = [N || {N,_} <- B],
+    proxy_multicall(ANodes, ?MODULE, disconnect_nodes, [BNodes]),
+    NewIslands = [A, B | Isls -- [I]],
+    ct:log("split ~p -> ~p", [Arg, NewIslands]),
+    St#{ islands => NewIslands };
+perform(rejoin, {A, B} = Arg, #{ islands := Isls } = St) ->
+    locks_ttb:event({?LINE, rejoin, Arg}),
+    ANodes = [N || {N,_} <- A],
+    BNodes = [N || {N,_} <- B],
+    proxy_multicall(ANodes, ?MODULE, allow, [BNodes]),
+    proxy_multicall(BNodes, ?MODULE, allow, [ANodes]),
+    proxy_multicall(ANodes, ?MODULE, connect_nodes, [BNodes]),
+    NewIslands = [ A ++ B | (Isls -- [A, B]) ],
+    ct:log("rejoined ~p -> ~p", [Arg, NewIslands]),
+    St#{ islands => NewIslands };
+perform(add, {Node, Island} = Arg, #{ islands := Isls
+                                    , idle := Idle
+                                    , dict := D } = St) ->
+    locks_ttb:event({?LINE, add, Arg}),
+    INodes = [N || {N,_} <- Island],
+    ok = call_proxy(Node, ?MODULE, connect_nodes, [INodes]),
+    ok = call_proxy(Node, application, start, [locks]),
+    {ok, Dx} = call_proxy(Node, gdict, new_opt, [[{resource, D}]]),
+    Island1 = [{Node, Dx}|Island],
+    ct:log("add ~p to ~p -> ~p", [Node, Island, Island1]),
+    St#{ islands => [Island1 | (Isls -- [Island])]
+       , idle => Idle -- [Node] };
+perform(update, Arg, St) ->
+    locks_ttb:event({?LINE, update, Arg}),
+    ct:log("update ~p - ignored", [Arg]),
+    St;
+perform(check, [{N,_}|_] = I, St) ->
+    ct:log("check: I = ~p", [I]),
+    Dicts = [D || {_,D} <- I],
+    true = ?retry(true, call_proxy(N, ?MODULE, same_leaders, [Dicts])),
+    St.
+
+next_cmd(St) ->
+    case cmds(St) of
+        [] ->
+            ct:log("No possible cmd. St = ~p", [St]),
+            stop;
+        [_|_] = Cmds ->
+            Cmd = oneof(Cmds),
+            {Cmd, cmd_args(Cmd, St)}
+    end.
+
+cmds(#{ islands := Isls, idle := Idle }) ->
+    [ split || [I || I <- Isls,
+                     length(I) > 1] =/= [] ]
+        ++ [ rejoin || length(Isls) > 1 ]
+        ++ [ update || Isls =/= [] ]
+        ++ [ add    || Idle =/= [] ]
+        ++ [ check  || Isls =/= [] ].
+
+cmd_args(split, #{ islands := Isls }) ->
+    I = oneof([I || I <- Isls,
+                    length(I) > 1]),
+    {A, B} = divide(I),
+    {I, A, B};
+cmd_args(rejoin, #{ islands := Isls }) ->
+    I1 = oneof(Isls),
+    I2 = oneof(Isls -- [I1]),
+    {I1, I2};
+cmd_args(update, #{ islands := Isls }) ->
+    oneof(Isls);
+cmd_args(add, #{ islands := Isls, idle := Idle }) ->
+    Island = case Isls of
+                 []    -> [];
+                 [_|_] -> oneof(Isls)
+             end,
+    {oneof(Idle), Island};
+cmd_args(check, #{ islands := Isls }) ->
+    oneof(Isls).
+
+oneof(L) ->
+    lists:nth(rand:uniform(length(L)), L).
+
+divide(L) ->
+    N = rand:uniform(length(L) - 1),
+    pick_n(N, L).
+
+pick_n(N, L) ->
+    pick_n(N, L, []).
+
+pick_n(N, L, Acc) when N > 0 ->
+    X = oneof(L),
+    pick_n(N-1, L -- [X], [X|Acc]);
+pick_n(_, Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+
 %% ============================================================
 %% Support code
 %% ============================================================
@@ -298,8 +426,13 @@ with_trace(F, Config, Name) ->
     Ns = get_slave_nodes(Config),
     Pats = [{test_cb, event, 3, []}|locks_ttb:default_patterns()],
     Flags = locks_ttb:default_flags(),
-    locks_ttb:trace_nodes([node()|Ns], Pats, Flags, [{file, Name}]),
-    try F(Config)
+    Nodes = [node() | Ns],
+    Opts = [{file, Name}],
+    locks_ttb:trace_nodes(Nodes, Pats, Flags, Opts),
+    try F([{locks_ttb, #{ pats => Pats
+                        , flags => Flags
+                        , opts => Opts
+                        , nodes => Nodes }} | Config])
     catch
         error:R ->
             Stack = erlang:get_stacktrace(),
@@ -334,10 +467,11 @@ insert_initial(D, []) ->
 insert_initial(_, _) ->
     ok.
 
-node_list(N) when is_integer(N), N > 0, N < 5 ->
-    lists:sublist(node_list(5), 1, N);
-node_list(5) ->
-    [locks_1, locks_2, locks_3, locks_4, locks_5].
+node_list(N) when is_integer(N), N > 0, N < 10 ->
+    lists:sublist(node_list(10), 1, N);
+node_list(10) ->
+    [ locks_1, locks_2, locks_3, locks_4, locks_5
+    , locks_6, locks_7, locks_8, locks_9, locks_10 ].
 
 retry(F, N) ->
     retry(F, N, undefined).
@@ -366,6 +500,13 @@ connect_nodes(Ns) ->
 leader_nodes(Ds) ->
     wait_for_dicts(Ds),
     [node(locks_leader:info(D, leader)) || D <- Ds].
+
+same_leaders(Ds) ->
+    Nodes = leader_nodes(Ds),
+    case lists:usort(Nodes) of
+        [_] -> true;
+        _   -> false
+    end.
 
 -define(PROXY, locks_leader_test_proxy).
 
@@ -422,7 +563,7 @@ start_slave(Name) ->
     {ok, Node} = ct_slave:start(host(), Name, [{erl_flags, Paths ++ Arg}]),
     {module,net_kernel} = rpc:call(Node, ?MODULE, patch_net_kernel, []),
     disconnect_node(Node),
-    true = net_kernel:hidden_connect(Node),
+    true = net_kernel:hidden_connect_node(Node),
     spawn(Node, ?MODULE, proxy, []),
     {Node, rpc:call(Node, os, getpid, [])}.
 
