@@ -458,8 +458,7 @@ eval_script([E|S], Agents, Acc) ->
     {Res, Agents1} =
         try  ask_agent(E, Agents, Acc)
         catch
-            error:Reason ->
-                Stack = erlang:get_stacktrace(),
+            error:Reason:Stack ->
                 io:fwrite(user, ("ERROR: ~p~n"
                                  "Script: ~p~n"
                                  "Trace: ~p~n"),

@@ -135,7 +135,6 @@
 	  mod_state,
 	  buffered = []}).
 
--include("locks_trace.hrl").
 -include("locks.hrl").
 -include("locks_debug.hrl").
 
@@ -461,7 +460,8 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		{ok, MSt} -> MSt;
 		{error, Reason} ->
 		    abort_init(Reason, Parent)
-	    ?_catch_(error, Error, ST)
+            catch
+                error:Error:ST ->
 		    abort_init({Error, ST}, Parent)
 	    end,
     AllNodes = ordsets:from_list([node()|nodes()]),

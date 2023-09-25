@@ -1,8 +1,8 @@
 {"1.2.0",
-[{<<"plain_fsm">>,{pkg,<<"plain_fsm">>,<<"1.4.1">>},0}]}.
+[{<<"plain_fsm">>,{pkg,<<"plain_fsm">>,<<"1.4.3">>},0}]}.
 [
 {pkg_hash,[
- {<<"plain_fsm">>, <<"47E9BF6AC9322FC7586FB6DF8DE7198391E93764571C75165F2C45B27ACDE1D0">>}]},
+ {<<"plain_fsm">>, <<"66C165B08ED16C9A32A3C99664DDC4134A77A0EB0D5531E15552E07B7A52345B">>}]},
 {pkg_hash_ext,[
- {<<"plain_fsm">>, <<"6CE2E7EFDCDC516EEBCED22A6ED2B1AB760F8275EE230F7C80B48DD32AE0DA39">>}]}
+ {<<"plain_fsm">>, <<"FBBA2DA4EB641F5E821218B461FEB3BB8B1223FEC1279A745DE3A2768D6D4F7A">>}]}
 ].
