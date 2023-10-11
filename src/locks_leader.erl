@@ -125,6 +125,7 @@
 	  leader,
           election_ref,
 	  nodes = ordsets:new(),
+          pg_mref :: reference(),
 	  candidates = [],
 	  workers = [],
           synced = [],
@@ -479,12 +480,16 @@ init_(Module, ModSt0, Options, Parent, Reg) ->
 		locks_server:watch(Lock, [node()]),
 		undefined
 	end,
+    PgGroup = {?MODULE, Lock},
+    {MRef, _} = locks_pg:monitor(PgGroup),
+    locks_pg:join(PgGroup, [self()]),
     proc_lib:init_ack(Parent, {ok, self()}),
     S1 = #st{agent = Agent,
              role = Role,
              mod = Module,
              mod_state = ModSt,
              lock = Lock,
+             pg_mref = MRef,
              %% mode = Mode,
              nodes = AllNodes,
              regname = Reg},
@@ -525,10 +530,15 @@ noreply(Stop) when element(1, Stop) == stop ->
 %% We enter safe_loop/1 as soon as no leader is elected
 safe_loop(#st{agent = A} = S) ->
     receive
-	{nodeup, N} = _Msg ->
-            ?log(_Msg, S),
+	{nodeup, N} = Msg ->
+            ?log(Msg, S),
 	    ?event({nodeup, N, nodes()}, S),
 	    noreply(nodeup(N, S));
+        {MRef, join, {?MODULE, Rsrc}, Pids} = Msg
+          when MRef == S#st.pg_mref, Rsrc == S#st.lock ->
+            ?log(Msg, S),
+            ?event({joined, Pids}, S),
+            noreply(joined(Pids, S));
 	{locks_agent, A, Info} = _Msg ->
             ?log(_Msg),
 	    ?event(_Msg, S),
@@ -662,6 +672,9 @@ handle_info_({?MODULE, am_leader, L, ERef, LeaderMsg} = _M, S) ->
 handle_info_({?MODULE, from_leader, L, ERef, LeaderMsg} = _M, S) ->
     ?event({handle_info, _M}, S),
     noreply(from_leader(L, ERef, LeaderMsg, S));
+handle_info_({MRef, join, {?MODULE, Rsrc}, Pids} = M,
+             #st{pg_mref = MRef, lock = Rsrc} = S) ->
+    noreply(joined(Pids, S));
 handle_info_({Ref, {'$locks_leader_reply', Reply}} = _M,
 	    #st{buffered = Buf} = S) ->
     ?event({handle_info, _M}, S),
@@ -779,6 +792,10 @@ nodeup(N, #st{nodes = Nodes} = S) ->
             include_node(N, S)
     end.
 
+joined(Pids, #st{candidates = Cands} = S) ->
+    NewCands = Pids -- Cands,
+    process_new_cands(NewCands, S).
+
 include_node(N, #st{agent = A, lock = Lock, nodes = Nodes} = S) ->
     ?event({include_node, N}),
     case ordsets:is_element(N, nodes()) of
@@ -796,6 +813,9 @@ locks_info(_, S) ->
 
 lock_info(#lock{queue = Q}, Node, #st{} = S) ->
     NewCands = new_cands(Node, Q, S),
+    process_new_cands(NewCands, S).
+
+process_new_cands(NewCands, #st{} = S) ->
     lists:foldl(fun(C, #st{nodes = Nodes} = Acc) ->
                         N = node(C),
                         SAcc = case ordsets:is_element(N, Nodes) of
@@ -919,11 +939,14 @@ maybe_remove_cand(worker, Pid, #st{workers = Ws} = S) ->
 
 become_leader(#st{agent = A} = S) ->
     {_, Locks} = LockInfo = locks_agent:lock_info(A),
+    ?event({lock_info, LockInfo}),
     S1 = refresh_vector(LockInfo, S),
+    ?event({s1_vector, S1#st.vector}),
     S2 = lists:foldl(
            fun(#lock{object = {OID,Node}} = L, Sx) ->
                    lock_info(L#lock{object = OID}, Node, Sx)
            end, S1, Locks),
+    ?event({s2_vector, S2#st.vector}),
     case S2#st.vector of
         #{leader := Lv} when Lv =/= A ->
             ?event(vector_questions_leader, S2),

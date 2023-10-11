@@ -24,7 +24,7 @@
 -module(locks_agent).
 -behaviour(gen_server).
 
--compile({parse_transform, locks_watcher}).
+%% -compile({parse_transform, locks_watcher}).
 
 -export([start_link/0, start_link/1, start/0, start/1]).
 -export([spawn_agent/1]).
@@ -445,7 +445,12 @@ init(Opts) ->
              end,
     AwaitNodes = proplists:get_value(await_nodes, Opts, false),
     MonNodes = proplists:get_value(monitor_nodes, Opts, false),
-    net_kernel:monitor_nodes(true),
+    MRef = if MonNodes ->
+                   {R, _} = locks_pg:monitor(locks_servers),
+                   R;
+              true ->
+                   undefined
+           end,
     {ok,#state{
            locks = ets_new(locks, [ordered_set, {keypos, #lock.object}]),
            agents = ets_new(agents, [ordered_set]),
@@ -454,6 +459,7 @@ init(Opts) ->
            monitored = orddict:new(),
            await_nodes = AwaitNodes,
            monitor_nodes = MonNodes,
+           locks_server_mref = MRef,
            pending = ets_new(pending, [bag, {keypos, #req.object}]),
            sync = [],
            client = Client,
@@ -595,9 +601,9 @@ handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, S0) ->
 handle_info({surrendered, A, OID, _V} = _Msg, State) ->
     ?event(_Msg),
     {noreply, note_deadlock(A, OID, State)};
-handle_info({'DOWN', _, _, _, {new_watcher, _Node, Pid}}, State) ->
-    erlang:monitor(process, Pid),
-    {noreply, State};
+%% handle_info({'DOWN', _, _, _, {new_watcher, _Node, Pid}}, State) ->
+%%     erlang:monitor(process, Pid),
+%%     {noreply, State};
 handle_info({'DOWN', Ref, _, _, _Rsn}, #state{client_mref = Ref} = State) ->
     ?event({client_DOWN, _Rsn}),
     {stop, normal, State};
@@ -609,29 +615,35 @@ handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
         false ->
             handle_nodedown(Node, S)
     end;
-handle_info({'DOWN',_,_,_,normal}, S) ->
-    %% most likely a watcher
-    {noreply, S};
-handle_info({'DOWN',_,process,Pid,_} = Down, #state{down=Down} = S) ->
-    error_logger:warning_msg("unknown DOWN: ~p", [Down]),
-    ?event({unknown_DOWN, Down}),
-    Node = node(Pid),
-    case lists:member(Node, Down) of
-        true  -> ignore;
-        false ->
-            ct:log("Restarting watcher for ~p ...", [Node]),
-            watch_node(Node)
-    end,
-    {noreply, S};
-handle_info({nodeup, N} = _Msg, #state{down = Down} = S) ->
-    ?event(_Msg),
-    case S#state.monitor_nodes orelse lists:member(N, Down) of
-        true  -> watch_node(N);
-        false -> ignore
-    end,
-    {noreply, S};
+%% handle_info({'DOWN',_,_,_,normal}, S) ->
+%%     %% most likely a watcher
+%%     {noreply, S};
+%% handle_info({'DOWN',_,process,Pid,_} = Down, #state{down=Down} = S) ->
+%%     error_logger:warning_msg("unknown DOWN: ~p", [Down]),
+%%     ?event({unknown_DOWN, Down}),
+%%     Node = node(Pid),
+%%     case lists:member(Node, Down) of
+%%         true  -> ignore;
+%%         false ->
+%%             ct:log("Restarting watcher for ~p ...", [Node]),
+%%             watch_node(Node)
+%%     end,
+%%     {noreply, S};
+%% handle_info({nodeup, N} = _Msg, #state{down = Down} = S) ->
+%%     ?event(_Msg),
+%%     case S#state.monitor_nodes orelse lists:member(N, Down) of
+%%         true  -> watch_node(N);
+%%         false -> ignore
+%%     end,
+%%     {noreply, S};
 handle_info({nodedown,_}, S) ->
     %% We react on 'DOWN' messages above instead
+    {noreply, S};
+handle_info({LSRef, join, locks_servers, Pids} = Msg,
+            #state{locks_server_mref = LSRef} = S) ->
+    ?event(Msg),
+    Nodes = remote_nodes(Pids),
+    [self() ! {locks_running, N} || N <- Nodes], % see next clause
     {noreply, S};
 handle_info({locks_running,N} = Msg, #state{down=Down, pending=Pending,
                                             requests = Reqs,
@@ -669,6 +681,13 @@ handle_info(_Msg, S) ->
     ?event({unknown_msg, _Msg}),
     {noreply, S}.
 
+remote_nodes(Pids) ->
+    remote_nodes(Pids, #{}).
+
+remote_nodes([P|Pids], Acc) ->
+    remote_nodes(Pids, Acc#{node(P) => 1});
+remote_nodes([], Acc) ->
+    maps:keys(maps:remove(node(), Acc)).
 
 add_waiter(nowait, _, _, State) ->
     State;
@@ -724,11 +743,11 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                             {stop, {cannot_lock_objects, Lost}, S1}
                     end;
                 true ->
-                    case MonNodes == false
-                        andalso lists:member(Node, nodes()) of
-                        true  -> watch_node(Node);
-                        false -> ignore
-                    end,
+                    %% case MonNodes == false
+                    %%     andalso lists:member(Node, nodes()) of
+                    %%     true  -> watch_node(Node);
+                    %%     false -> ignore
+                    %% end,
                     if PRs =/= [] ->
                             {noreply, check_if_done(S1)};
                        true ->
@@ -742,30 +761,30 @@ handle_monitor_on_down(_, #state{monitor_nodes = false}) ->
 handle_monitor_on_down(Node, #state{monitor_nodes = true,
                                     client = C}) ->
     C ! {nodedown, Node},
-    case lists:member(Node, nodes()) of
-        true ->
-            watch_node(Node);
-        false ->
-            ignore
-    end,
+    %% case lists:member(Node, nodes()) of
+    %%     true ->
+    %%         watch_node(Node);
+    %%     false ->
+    %%         ignore
+    %% end,
     ok.
 
 prune_interesting(I, Type, Node) ->
     locks_agent_lib:prune_interesting(I, Type, Node).
 
-watch_node(N) ->
-    {M, F, A} =
-        locks_watcher(self()),  % expanded through parse_transform
-    spawn_after(500, N, M, F, A).
-    %% erlang:monitor(process, P).
+%% watch_node(N) ->
+%%     {M, F, A} =
+%%         locks_watcher(self()),  % expanded through parse_transform
+%%     spawn_after(500, N, M, F, A).
+%%     %% erlang:monitor(process, P).
 
-spawn_after(Time, N, M, F, A) ->
-    spawn_monitor(fun() ->
-                          receive
-                          after Time ->
-                                  exit({new_watcher, N, spawn(N, M, F, A)})
-                          end
-                  end).
+%% spawn_after(Time, N, M, F, A) ->
+%%     spawn_monitor(fun() ->
+%%                           receive
+%%                           after Time ->
+%%                                   exit({new_watcher, N, spawn(N, M, F, A)})
+%%                           end
+%%                   end).
 
 check_note({surrender, A, V}, LockID, State) when A == self() ->
     ?event({surrender_ack, LockID, V}),

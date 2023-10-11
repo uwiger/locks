@@ -39,5 +39,5 @@ start_link() ->
 
 init([]) ->
     {ok, { {one_for_one, 0, 10},
-	   [?CHILD(locks_server, worker)]} }.
-
+	   [ ?CHILD(locks_pg, worker)
+           , ?CHILD(locks_server, worker) ]} }.

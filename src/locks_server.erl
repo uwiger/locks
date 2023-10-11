@@ -48,7 +48,8 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    catch locks_watcher ! locks_running,
+    %% catch locks_watcher ! locks_running,
+    locks_pg:join(locks_servers, [self()]),
     {ok, #st{}}.
 
 clients(LockID) ->
