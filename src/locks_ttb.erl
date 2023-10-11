@@ -181,8 +181,8 @@ pp_term(D) when element(1,D) == dict ->
     end;
 pp_term(T) when is_tuple(T) ->
     list_to_tuple([pp_term(Trm) || Trm <- tuple_to_list(T)]);
-pp_term(L) when is_list(L) ->
-    [pp_term(T) || T <- L];
+pp_term([H|T]) ->
+    [pp_term(H) | pp_term(T)];
 pp_term(T) ->
     T.
 

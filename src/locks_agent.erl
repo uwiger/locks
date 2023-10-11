@@ -595,6 +595,9 @@ handle_info(#locks_info{lock = Lock0, where = Node, note = Note} = I, S0) ->
 handle_info({surrendered, A, OID, _V} = _Msg, State) ->
     ?event(_Msg),
     {noreply, note_deadlock(A, OID, State)};
+handle_info({'DOWN', _, _, _, {new_watcher, _Node, Pid}}, State) ->
+    erlang:monitor(process, Pid),
+    {noreply, State};
 handle_info({'DOWN', Ref, _, _, _Rsn}, #state{client_mref = Ref} = State) ->
     ?event({client_DOWN, _Rsn}),
     {stop, normal, State};
@@ -606,8 +609,19 @@ handle_info({'DOWN', _, process, {?LOCKER, Node}, _},
         false ->
             handle_nodedown(Node, S)
     end;
-handle_info({'DOWN',_,_,_,_}, S) ->
+handle_info({'DOWN',_,_,_,normal}, S) ->
     %% most likely a watcher
+    {noreply, S};
+handle_info({'DOWN',_,process,Pid,_} = Down, #state{down=Down} = S) ->
+    error_logger:warning_msg("unknown DOWN: ~p", [Down]),
+    ?event({unknown_DOWN, Down}),
+    Node = node(Pid),
+    case lists:member(Node, Down) of
+        true  -> ignore;
+        false ->
+            ct:log("Restarting watcher for ~p ...", [Node]),
+            watch_node(Node)
+    end,
     {noreply, S};
 handle_info({nodeup, N} = _Msg, #state{down = Down} = S) ->
     ?event(_Msg),
@@ -742,8 +756,16 @@ prune_interesting(I, Type, Node) ->
 watch_node(N) ->
     {M, F, A} =
         locks_watcher(self()),  % expanded through parse_transform
-    P = spawn(N, M, F, A),
-    erlang:monitor(process, P).
+    spawn_after(500, N, M, F, A).
+    %% erlang:monitor(process, P).
+
+spawn_after(Time, N, M, F, A) ->
+    spawn_monitor(fun() ->
+                          receive
+                          after Time ->
+                                  exit({new_watcher, N, spawn(N, M, F, A)})
+                          end
+                  end).
 
 check_note({surrender, A, V}, LockID, State) when A == self() ->
     ?event({surrender_ack, LockID, V}),

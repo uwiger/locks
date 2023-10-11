@@ -88,47 +88,39 @@ init_per_group(g_local, Config) ->
     application:start(locks),
     Config;
 init_per_group(g_2, Config) ->
+    ct:log("group g_2; my pid: ~p", [self()]),
     application:start(locks),
-    Ns = start_slaves(node_list(2)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(2), Config);
 init_per_group(g_3, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(3)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(3), Config);
 init_per_group(g_4, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(4)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(4), Config);
 init_per_group(g_5, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(5)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(5), Config);
 init_per_group(g_2i, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(2)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(2), Config);
 init_per_group(g_3i, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(3)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(3), Config);
 init_per_group(g_4i, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(4)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(4), Config);
 init_per_group(g_5i, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(5)),
-    [{slaves, Ns}|Config];
+    start_slaves(node_list(5), Config);
 init_per_group(random_netsplits, Config) ->
     application:start(locks),
-    Ns = start_slaves(node_list(10)),
-    [{slaves, Ns}|Config].
+    start_slaves(node_list(10), Config).
 
 end_per_group(g_local, _Config) ->
     application:stop(locks);
 end_per_group(_Group, Config) ->
     application:stop(locks),
-    stop_slaves(?config(slaves, Config)),
+    stop_slaves(Config),
     ok.
 
 init_per_testcase(_Case, Config) ->
@@ -171,10 +163,13 @@ gdict_all_nodes(Config) ->
     with_trace(fun gdict_all_nodes_/1, Config, "leader_tests_all_nodes").
 
 gdict_all_nodes_(Config) ->
+    ct:log("gdict_all_nodes(); my pid: ~p", [self()]),
     [H|T] = Ns = get_slave_nodes(Config),
+    OtherNodes = [N || #{node := N} <- T],
     Name = [?MODULE,?LINE],
-    ok = call_proxy(H, ?MODULE, connect_nodes, [T]),
-    T = call_proxy(H, erlang, nodes, []),
+    ct:log("OtherNodes = ~p", [OtherNodes]),
+    ok = call_proxy(H, ?MODULE, connect_nodes, [OtherNodes]),
+    OtherNodes = call_proxy(H, erlang, nodes, []),
     ok = lists:foreach(
            fun(ok) -> ok end,
            proxy_multicall(Ns, application, start, [locks])),
@@ -186,7 +181,8 @@ gdict_all_nodes_(Config) ->
            fun({_Node,{ok,1}}) -> false;
               (_) -> true
            end,
-           lists:zip(Ns, [?retry({ok,1}, gdict:find(a,D)) || D <- Dicts])),
+           lists:zip(nodes_of(Ns),
+		     [?retry({ok,1}, gdict:find(a,D)) || D <- Dicts])),
     [exit(D, kill) || D <- Dicts],
     proxy_multicall(Ns, application, stop, [locks]),
     ok.
@@ -198,6 +194,7 @@ gdict_simple_netsplit(Config) ->
 gdict_simple_netsplit_(Config) ->
     Name = [?MODULE, ?LINE],
     [A, B] = Ns = get_slave_nodes(Config),
+    NodeB = node_of(B),
     ok = lists:foreach(
            fun(ok) -> ok end,
            proxy_multicall(Ns, application, start, [locks])),
@@ -206,7 +203,7 @@ gdict_simple_netsplit_(Config) ->
     wait_for_dicts(Dicts),
     [X, X] = [locks_leader:info(Dx, leader) || Dx <- Dicts],
     locks_ttb:event({?LINE, initial_consensus}),
-    call_proxy(A, erlang, disconnect_node, [B]),
+    call_proxy(A, erlang, disconnect_node, [NodeB]),
     [] = call_proxy(A, erlang, nodes, []),
     [] = call_proxy(B, erlang, nodes, []),
     locks_ttb:event({?LINE, netsplit_ready}),
@@ -215,12 +212,23 @@ gdict_simple_netsplit_(Config) ->
     true = (L1 =/= L2),
     locks_ttb:event({?LINE, reconnecting}),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
-    proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
-    [B] = call_proxy(A, erlang, nodes, []),
+    proxy_multicall(Ns, ?MODULE, connect_nodes, [nodes_of(Ns)]),
+    [NodeB] = call_proxy(A, erlang, nodes, []),
     [Z,Z] = ?retry([Z,Z], call_proxy(A, ?MODULE, leader_nodes, [Dicts])),
     locks_ttb:event({?LINE, leader_consensus, Ns, Z}),
     proxy_multicall(Ns, application, stop, [locks]),
     ok.
+
+node_of(#{node := N}) ->
+    N;
+node_of(N) when is_atom(N) ->
+    N.
+
+nodes_of(Ns) ->
+    lists:map(fun(#{node := N}) -> N end, Ns).
+
+dicts_of(Ns) ->
+    lists:map(fun(#{dict := D}) -> D end, Ns).
 
 %% wait for leaders to get out of safe loop
 wait_for_dicts(Dicts) ->
@@ -233,16 +241,17 @@ gdict_netsplit(Config) ->
 gdict_netsplit_(Config) ->
     Name = [?MODULE, ?LINE],
     [A,B|[C|_] = Rest] = Ns = get_slave_nodes(Config),
-    proxy_multicall([A,B], ?MODULE, disconnect_nodes, [Rest]),
-    [B] = call_proxy(A, erlang, nodes, []),
-    [A] = call_proxy(B, erlang, nodes, []),
+    [NodeA, NodeB, NodeC] = [node_of(X) || X <- [A,B,C]],
+    proxy_multicall([A,B], ?MODULE, disconnect_nodes, [nodes_of(Rest)]),
+    [NodeB] = call_proxy(A, erlang, nodes, []),
+    [NodeA] = call_proxy(B, erlang, nodes, []),
     locks_ttb:event({?LINE, netsplit_ready}),
     ok = lists:foreach(
            fun(ok) -> ok end,
            proxy_multicall(Ns, application, start, [locks])),
     Results = proxy_multicall(Ns, gdict, new_opt, [[{resource, Name}]]),
     [Da,Db|[Dc|_] = DRest] = Dicts = lists:map(fun({ok,Dx}) -> Dx end, Results),
-    locks_ttb:event({?LINE, dicts_created, lists:zip(Ns, Dicts)}),
+    locks_ttb:event({?LINE, dicts_created, lists:zip(nodes_of(Ns), Dicts)}),
     ok = ?retry(ok, gdict:store(a, 1, Da)),
     ok = gdict:store(b, 2, Dc),
     {ok, 1} = ?retry({ok,1}, gdict:find(a, Db)),
@@ -260,8 +269,8 @@ gdict_netsplit_(Config) ->
     error = gdict:find(b, Da),
     locks_ttb:event({?LINE, reconnecting}),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
-    proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
-    [B,C|_] = lists:sort(call_proxy(A, erlang, nodes, [])),
+    proxy_multicall(Ns, ?MODULE, connect_nodes, [nodes_of(Ns)]),
+    [NodeB,NodeC|_] = lists:sort(call_proxy(A, erlang, nodes, [])),
     [Z] = ?retry([_],
                 lists:usort(call_proxy(A, ?MODULE, leader_nodes, [Dicts]))),
     locks_ttb:event({?LINE, leader_consensus, Ns, Z}),
@@ -285,12 +294,15 @@ start_incremental([N|Ns], Alive, Name) ->
     start_incremental(N, Alive, Ns, Name).
 
 start_incremental(N, Alive, Rest, Name) ->
-    maybe_connect(N, Alive),
-    ok = rpc:call(N, application, start, [locks]),
+    ct:log("start_incremental, N = ~p, Alive = ~p", [N, Alive]),
+    ConnectRes = maybe_connect(N, Alive),
+    ct:log("ConnectRes = ~p", [ConnectRes]),
+    ok = call_proxy(N, application, start, [locks]),
+    ct:log("locks started on ~p", [node_of(N)]),
     {ok, D} = call_proxy(N, gdict, new_opt, [[{resource, Name}]]),
     ct:log("Dict created on ~p: ~p~n", [N, D]),
     insert_initial(D, Alive),
-    NewAlive = [{N, D}|Alive],
+    NewAlive = [{node_of(N), D}|Alive],
     Vals = [{D, ?retry({ok,1}, gdict:find(a, D1))}
             || {_,D1} <- NewAlive],
     ct:log("Values = ~p~n", [Vals]),
@@ -324,42 +336,42 @@ do_random_splits(_, _, _) ->
     ok.
 
 perform(split, {I, A, B} = Arg, #{ islands := Isls } = St) ->
+    ct:log("split ~p", [{nodes_of(I), nodes_of(A), nodes_of(B)}]),
     locks_ttb:event({?LINE, split, Arg}),
-    ANodes = [N || {N,_} <- A],
-    BNodes = [N || {N,_} <- B],
-    proxy_multicall(ANodes, ?MODULE, disconnect_nodes, [BNodes]),
+    BNodes = nodes_of(B),
+    proxy_multicall(A, ?MODULE, disconnect_nodes, [BNodes]),
     NewIslands = [A, B | Isls -- [I]],
-    ct:log("split ~p -> ~p", [Arg, NewIslands]),
+    ct:log("split -> ~p", [[nodes_of(Ni) || Ni <- NewIslands]]),
     St#{ islands => NewIslands };
 perform(rejoin, {A, B} = Arg, #{ islands := Isls } = St) ->
     locks_ttb:event({?LINE, rejoin, Arg}),
-    ANodes = [N || {N,_} <- A],
-    BNodes = [N || {N,_} <- B],
-    proxy_multicall(ANodes, ?MODULE, allow, [BNodes]),
-    proxy_multicall(BNodes, ?MODULE, allow, [ANodes]),
-    proxy_multicall(ANodes, ?MODULE, connect_nodes, [BNodes]),
+    ANodes = nodes_of(A),
+    BNodes = nodes_of(B),
+    proxy_multicall(A, ?MODULE, allow, [BNodes]),
+    proxy_multicall(B, ?MODULE, allow, [ANodes]),
+    proxy_multicall(A, ?MODULE, connect_nodes, [BNodes]),
     NewIslands = [ A ++ B | (Isls -- [A, B]) ],
-    ct:log("rejoined ~p -> ~p", [Arg, NewIslands]),
+    ct:log("rejoined ~p -> ~p", [{nodes_of(A), nodes_of(B)}, [nodes_of(I) || I <- NewIslands]]),
     St#{ islands => NewIslands };
 perform(add, {Node, Island} = Arg, #{ islands := Isls
                                     , idle := Idle
                                     , dict := D } = St) ->
     locks_ttb:event({?LINE, add, Arg}),
-    INodes = [N || {N,_} <- Island],
+    INodes = nodes_of(Island),
     ok = call_proxy(Node, ?MODULE, connect_nodes, [INodes]),
     ok = call_proxy(Node, application, start, [locks]),
     {ok, Dx} = call_proxy(Node, gdict, new_opt, [[{resource, D}]]),
-    Island1 = [{Node, Dx}|Island],
-    ct:log("add ~p to ~p -> ~p", [Node, Island, Island1]),
+    Island1 = [Node#{dict => Dx}|Island],
+    ct:log("add ~p to ~p -> ~p", [node_of(Node), nodes_of(Island), nodes_of(Island1)]),
     St#{ islands => [Island1 | (Isls -- [Island])]
        , idle => Idle -- [Node] };
 perform(update, Arg, St) ->
     locks_ttb:event({?LINE, update, Arg}),
-    ct:log("update ~p - ignored", [Arg]),
+    ct:log("update - ignored", []),
     St;
-perform(check, [{N,_}|_] = I, St) ->
-    ct:log("check: I = ~p", [I]),
-    Dicts = [D || {_,D} <- I],
+perform(check, [N|_] = I, St) ->
+    ct:log("check: I = ~p", [nodes_of(I)]),
+    Dicts = dicts_of(I),
     true = ?retry(true, call_proxy(N, ?MODULE, same_leaders, [Dicts])),
     St.
 
@@ -423,7 +435,8 @@ pick_n(_, Rest, Acc) ->
 %% ============================================================
 
 with_trace(F, Config, Name) ->
-    Ns = get_slave_nodes(Config),
+    Ns = nodes_of(get_slave_nodes(Config)),
+    ct:log("with_trace: Ns = ~p", [Ns]),
     Pats = [{test_cb, event, 3, []}|locks_ttb:default_patterns()],
     Flags = locks_ttb:default_flags(),
     Nodes = [node() | Ns],
@@ -457,9 +470,9 @@ ttb_stop() ->
 
 
 maybe_connect(_, []) ->
-    ok;
-maybe_connect(N, [{N1,_}|_]) ->
-    call_proxy(N, net_kernel, connect, [N1]).
+    empty;
+maybe_connect(N, [{N1, _}|_]) ->
+    call_proxy(N, net_kernel, connect_node, [N1]).
 
 insert_initial(D, []) ->
     gdict:store(a, 1, D);
@@ -486,14 +499,14 @@ retry(_, _, Last) ->
     Last.
 
 disconnect_nodes(Ns) ->
-    [{true,_} = {erlang:disconnect_node(N), N} || N <- Ns, N =/= node()],
+    [{true,_} = {erlang:disconnect_node(node_of(N)), N} || N <- Ns, node_of(N) =/= node()],
     ok.
 
 unbar_nodes() ->
     gen_server:call(net_kernel, unbar_all).
 
 connect_nodes(Ns) ->
-    [{true,_} = {net_kernel:connect_node(N), N} || N <- Ns, N =/= node()],
+    [{true,_} = {net_kernel:connect_node(node_of(N)), N} || N <- Ns, node_of(N) =/= node()],
     ok.
 
 leader_nodes(Ds) ->
@@ -510,7 +523,6 @@ same_leaders(Ds) ->
 -define(PROXY, locks_leader_test_proxy).
 
 proxy() ->
-    register(?PROXY, self()),
     process_flag(trap_exit, true),
     proxy_loop().
 
@@ -518,6 +530,8 @@ proxy_loop() ->
     receive
         {From, Ref, apply, M, F, A} ->
             From ! {Ref, (catch apply(M,F,A))};
+	{From, Ref, apply, F} when is_function(F, 0) ->
+	    From ! {Ref, (catch F())};
         _ ->
             ok
     end,
@@ -526,22 +540,54 @@ proxy_loop() ->
 proxy_multicall(Ns, M, F, A) ->
     [call_proxy(N, M, F, A) || N <- Ns].
 
-call_proxy(N, M, F, A) ->
-    Ref = erlang:monitor(process, {?PROXY, N}),
-    {?PROXY, N} ! {self(), Ref, apply, M, F, A},
+call_proxy(#{node := N, proxy := Proxy, peer := Peer}, M, F, A) ->
+    Ref = erlang:monitor(process, Proxy),
+    Proxy ! {self(), Ref, apply, M, F, A},
     receive
         {'DOWN', Ref, _, _, Reason} ->
             error({proxy_died, N, Reason});
         {Ref, Result} ->
             Result
-    after 1000 ->
+    after 5000 ->
+	    ct:log("Timeout calling apply(~p, ~p, ~p) on ~p", [M, F, A, N]),
+	    ct:log("Peer status: ~p", [peer:get_state(Peer)]),
             error(proxy_call_timeout)
     end.
 
-get_slave_nodes(Config) ->
-    [N || {N,_} <- proplists:get_value(slaves, Config, [])].
+call_proxy(P, F) when is_pid(P), is_function(F, 0) ->
+    call_proxy(P, F, 5000).
 
-start_slaves(Ns) ->
+call_proxy(P, F, Timeout) when is_pid(P), is_function(F, 0) ->
+    Ref = erlang:monitor(process, P),
+    P ! {self(), Ref, apply, F},
+    receive
+	{'DOWN', Ref, _, _, Reason} ->
+	    error({proxy_died, P, Reason});
+	{Ref, Result} ->
+	    Result
+    after Timeout ->
+	    error(proxy_call_timeout)
+    end.
+
+get_slave_nodes(Config) ->
+    proplists:get_value(slaves, Config, []).
+
+start_slaves(Ns, Config) ->
+    case proplists:get_value(peer_proxy, Config) of
+	undefined ->
+	    %% Create a local proxy with spawn() (not spawn_link())
+	    %% which is meant to survive across multiple tests
+	    LocalProxy = spawn(fun proxy/0),
+	    start_slaves_(LocalProxy, Ns, Config);
+	Proxy ->
+	    start_slaves_(Proxy, Ns, Config)
+    end.
+
+start_slaves_(LocalProxy, Ns, Config) ->
+    Nodes = call_proxy(LocalProxy, fun() -> do_start_slaves(Ns) end, 10000),
+    [{slaves, Nodes}, {peer_proxy, LocalProxy} | Config].
+
+do_start_slaves(Ns) ->
     Nodes = [start_slave(N) || N <- Ns],
     ct:log("start_slaves() -> ~p~n", [Nodes]),
     Nodes.
@@ -555,35 +601,57 @@ start_slave(Name) ->
             ok
     end,
     {Pa, Pz} = paths(),
-    Paths = "-pa ./ -pz ../ebin" ++
-        lists:flatten([[" -pa " ++ Path || Path <- Pa],
-                       [" -pz " ++ Path || Path <- Pz]]),
-    Arg = " -kernel dist_auto_connect once",
-    {ok, Node} = ct_slave:start(host(), Name, [{erl_flags, Paths ++ Arg}]),
-    {module,net_kernel} = rpc:call(Node, ?MODULE, patch_net_kernel, []),
-    disconnect_node(Node),
+    PathsA = lists:foldr(
+	       fun(P, Acc) ->
+		       ["-pa", P | Acc]
+	       end, [], Pa),
+    PathsZ = lists:foldr(
+	       fun(P, Acc) ->
+		       ["-pz", P | Acc]
+	       end, [], Pz),
+    Paths = ["-pa", "./", "-pz", "../ebin" | PathsA] ++ PathsZ,
+    Arg = ["-kernel", "dist_auto_connect", "once",
+	   "-kernel", "prevent_overlapping_partitions", "false"],
+    {ok, Peer, Node} = ?CT_PEER(#{name => Name,
+				  peer_down => continue,
+				  connection => 0, % alt conn, auto-port
+				  args => Arg ++ Paths}),
+    {module,net_kernel} = peer:call(Peer, ?MODULE, patch_net_kernel, []),
     true = net_kernel:hidden_connect_node(Node),
-    spawn(Node, ?MODULE, proxy, []),
-    {Node, rpc:call(Node, os, getpid, [])}.
+    Node = rpc:call(Node, erlang, node, []),  %% just checking liveness
+    Proxy = spawn(Node, ?MODULE, proxy, []),
+    #{node => Node, peer => Peer, proxy => Proxy}.
 
-stop_slaves(Ns) ->
-    [ok = stop_slave(N) || N <- Ns],
+stop_slaves(Config) ->
+    case proplists:get_value(peer_proxy, Config) of
+	undefined ->
+	    ct:log("No peer proxy", []),
+	    Slaves = proplists:get_value(slaves, Config, []),
+	    [ok = stop_slave(N) || N <- Slaves];
+	Proxy ->
+	    Slaves = proplists:get_value(slaves, Config, []),
+	    call_proxy(Proxy, fun() ->
+				      [ok = stop_slave(N)
+				       || N <- Slaves]
+			      end)
+    end,
     ok.
 
-stop_slave({N, Pid}) ->
-    try erlang:monitor_node(N, true) of
-        true ->
-            rpc:call(N, erlang, halt, []),
-            receive
-                {nodedown, N} -> ok
-            after 10000 ->
-                    os:cmd("kill -9 " ++ Pid),
-                    ok
-            end
-    catch
-        error:badarg ->
-            ok
-    end.
+stop_slave(#{peer := Peer}) ->
+    peer:stop(Peer).
+    %% try erlang:monitor_node(N, true) of
+    %%     true ->
+    %%         rpc:call(N, erlang, halt, []),
+    %%         receive
+    %%             {nodedown, N} -> ok
+    %%         after 10000 ->
+    %%                 os:cmd("kill -9 " ++ Pid),
+    %%                 ok
+    %%         end
+    %% catch
+    %%     error:badarg ->
+    %%         ok
+    %% end.
 
 paths() ->
     Path = code:get_path(),
@@ -596,17 +664,11 @@ paths() ->
                        end, Rest),
     {Pas, Pzs}.
 
-
-host() ->
-    [_Name, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
-    list_to_atom(Host).
-
-
 patch_net_kernel() ->
     NetKernel = code:which(net_kernel),
     {ok, {_,[{abstract_code,
               {raw_abstract_v1,
-               [{attribute,1,file,_}|Forms]}}]}} =
+               [{attribute,_,file,_}|Forms]}}]}} =
         beam_lib:chunks(NetKernel, [abstract_code]),
     NewForms = xform_net_kernel(Forms),
     try
@@ -620,6 +682,7 @@ patch_net_kernel() ->
             io:fwrite(user, "~p: ERROR:~p~n", [?LINE, What]),
             error({What, ST})
     end.
+
 
 xform_net_kernel({function,L,handle_call,3,Clauses}) ->
     {function,L,handle_call,3,

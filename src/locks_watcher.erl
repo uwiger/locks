@@ -79,7 +79,7 @@ transform([{call,L,{atom,L,locks_watcher},Args}|T]) ->
 			       fun(A, B) ->
 				       {tuple,L,[A,B]}
 			       end, [{atom,L,V} || V <- Vars], Args), L),
-		%% The actual call to erl_eval:exprts(Exprs) must be in
+		%% The actual call to erl_eval:exprs(Exprs) must be in
 		%% abstract form, but Exprs must be abstract abstract form,
 		%% since it shall be abstract at run-time.
 		{tuple,L,[{atom,L,erl_eval},

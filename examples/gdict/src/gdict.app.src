@@ -1,6 +1,6 @@
 {application, gdict,
  [
-  {description, ""},
+  {description, "Example locks_leader app: replicated dict"},
   {vsn, "1"},
   {registered, []},
   {applications, [
