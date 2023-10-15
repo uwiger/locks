@@ -36,7 +36,8 @@
 	 lock_objects/2,
          surrender_nowait/4,
 	 await_all_locks/1,
-         async_await_all_locks/1,
+         async_await_all_locks/1,  % (AgentPid)
+         async_await_all_locks/2,  % (AgentPid, SinceClaim)
          monitor_nodes/2,
          change_flag/3,
 	 lock_info/1,
@@ -168,6 +169,10 @@ prepare_spawn(Options) ->
         false -> [{client, self()}|Options]
     end.
 
+-spec agent_init(Wait, Client, Options) -> no_return()
+              when Wait :: boolean(),
+                   Client :: pid(),
+                   Options :: list().
 agent_init(Wait, Client, Options) ->
     case init(Options) of
         {ok, St} ->
@@ -281,10 +286,14 @@ begin_transaction(Objects, Opts) ->
 %% instructed to abort, this function will raise an exception.
 %% @end
 await_all_locks(Agent) ->
-    call(Agent, await_all_locks,infinity).
+    #{status := Status} = call(Agent, await_all_locks,infinity),
+    Status.
 
 async_await_all_locks(Agent) ->
     cast(Agent, {await_all_locks, self()}).
+
+async_await_all_locks(Agent, LastClaimNo) ->
+    cast(Agent, {await_all_locks, self(), LastClaimNo}).
 
 -spec monitor_nodes(agent(), boolean()) -> boolean().
 %% @doc Toggles monitoring of nodes, like net_kernel:monitor_nodes/1.
@@ -364,7 +373,7 @@ await_reply(Ref) ->
             Reply
     end.
 
-lock_return(wait, {have_all_locks, Deadlocks}) ->
+lock_return(wait, #{status := {have_all_locks, Deadlocks}}) ->
     {ok, Deadlocks};
 lock_return(nowait, ok) ->
     ok;
@@ -477,11 +486,11 @@ handle_call(transaction_status, _From, #state{status = Status} = State) ->
 handle_call(await_all_locks, {Client, Tag},
             #state{status = Status, awaiting_all = Aw} = State) ->
     case Status of
+        State1 = State#state{awaiting_all = [{Client, Tag} | Aw]},
         {have_all_locks, _} ->
-            {noreply, notify_have_all(
-                        State#state{awaiting_all = [{Client, Tag}|Aw]})};
+            {noreply, notify_have_all(State1)};
         _ ->
-            {noreply, check_if_done(add_waiter(wait, Client, Tag, State))}
+            {noreply, check_if_done(State1)}
     end;
 handle_call({monitor_nodes, Bool}, _From, St) when is_boolean(Bool) ->
     {reply, St#state.monitor_nodes, St#state{monitor_nodes = Bool}};
@@ -504,15 +513,10 @@ handle_cast({lock, Object, Mode, Nodes, Require, Wait, Client, Tag} = _Req,
         {true, S1} ->
             {noreply, check_if_done(S1)}
     end;
-handle_cast({await_all_locks, Pid},
-            #state{status = Status, awaiting_all = Aw} = State) ->
-    case Status of
-        {have_all_locks, _} ->
-            {noreply, notify_have_all(
-                        State#state{awaiting_all = [{Pid,async}|Aw]})};
-        _ ->
-            {noreply, check_if_done(add_waiter(wait, Pid, async, State))}
-    end;
+handle_cast({await_all_locks, Pid}, State) ->
+    handle_async_await(Pid, 0, State);
+handle_cast({await_all_locks, Pid, SinceClaim}, State) ->
+    handle_async_await(Pid, SinceClaim, State);
 handle_cast({surrender, O, ToAgent, Nodes} = _Req, S) ->
     ?event(_Req, S),
     case lists:all(
@@ -556,6 +560,17 @@ handle_cast({option, O, Val}, #state{notify = Notify,
     {noreply, S1};
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_async_await(Pid, SinceClaim, #state{ status = Status
+                                          , awaiting_all = Aw
+                                          , claim_no = LastClaim } = S) ->
+    S1 = S#state{awaiting_all = [{Pid, {async, SinceClaim}} | Aw]},
+    case Status of
+        {have_all_locks, _} when LastClaim > SinceClaim ->
+            {noreply, notify_have_all(S1)};
+        _ ->
+            {noreply, check_if_done(S1)}
+    end.
 
 list_store(E, L) ->
     case lists:member(E, L) of
@@ -716,8 +731,7 @@ handle_nodedown(Node, #state{down = Down, requests = Reqs,
                              pending = Pending,
                              monitored = Mon, locks = Locks,
                              interesting = I,
-                             agents = Agents,
-                             monitor_nodes = MonNodes} = S) ->
+                             agents = Agents} = S) ->
     ?event({handle_nodedown, Node}, S),
     handle_monitor_on_down(Node, S),
     ets_match_delete(Locks, #lock{object = {'_',Node}, _ = '_'}),
@@ -847,16 +861,23 @@ have_all(#state{have_all = Prev, claim_no = Cl} = State) ->
           end,
     notify_have_all(State#state{have_all = true, claim_no = Cl1}).
 
-notify_have_all(#state{awaiting_all = Aw, status = Status} = S) ->
-    [reply_await_(W, Status) || W <- Aw],
-    S#state{awaiting_all = []}.
+notify_have_all(#state{awaiting_all = Aw, status = Status, claim_no = Cl} = S) ->
+    {Notify, Rest} = lists:partition(
+                       fun({async, Since}) when Cl > Since -> false;
+                          (_) -> true
+                       end, Aw),
+    [reply_await_(W, Status, Cl) || W <- Aw],
+    S#state{awaiting_all = Rest}.
 
 %% reply_await_({Pid, notify}, Status) ->
 %%     notify_(Pid, Status);
-reply_await_({Pid, async}, Status) ->
-    notify_(Pid, Status);
-reply_await_(From, Status) ->
-    gen_server:reply(From, Status).
+reply_await_({Pid, async}, Status, ClaimNo) ->
+    notify_(Pid, Status, ClaimNo);
+reply_await_({Pid, {async, _SinceClaim}}, Status, ClaimNo) ->
+    notify_(Pid, Status, ClaimNo);
+reply_await_(From, Status, ClaimNo) ->
+    gen_server:reply(From, #{ status => Status
+                            , claim_no => ClaimNo }).
 
 abort_on_deadlock(OID, State) ->
     notify({abort, Reason = {deadlock, OID}}, State),
@@ -868,12 +889,14 @@ notify_msgs([M|Ms], S) ->
 notify_msgs([], S) ->
     S.
 
-notify(Msg, #state{notify = Notify} = State) ->
-    [notify_(P, Msg) || P <- Notify],
+-spec notify(lock_result(), #state{}) -> #state{}.
+notify(Msg, #state{notify = Notify, claim_no = Cl} = State) ->
+    [notify_(P, Msg, Cl) || P <- Notify],
     State.
 
-notify_(P, Msg) ->
-    P ! {?MODULE, self(), Msg}.
+notify_(P, Msg, ClaimNo) ->
+    P ! {?MODULE, self(), #{ claim_no => ClaimNo
+                           , status   => Msg }}.
 
 handle_locks(S) ->
     S#state{handle_locks = true}.

@@ -125,7 +125,7 @@
 	  leader,
           election_ref,
 	  nodes = ordsets:new(),
-          pg_mref :: reference(),
+          pg_mref :: reference() | undefined,
 	  candidates = [],
 	  workers = [],
           synced = [],
@@ -672,7 +672,7 @@ handle_info_({?MODULE, am_leader, L, ERef, LeaderMsg} = _M, S) ->
 handle_info_({?MODULE, from_leader, L, ERef, LeaderMsg} = _M, S) ->
     ?event({handle_info, _M}, S),
     noreply(from_leader(L, ERef, LeaderMsg, S));
-handle_info_({MRef, join, {?MODULE, Rsrc}, Pids} = M,
+handle_info_({MRef, join, {?MODULE, Rsrc}, Pids},
              #st{pg_mref = MRef, lock = Rsrc} = S) ->
     noreply(joined(Pids, S));
 handle_info_({Ref, {'$locks_leader_reply', Reply}} = _M,

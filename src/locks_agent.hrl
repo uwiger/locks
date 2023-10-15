@@ -31,7 +31,7 @@
           client_mref           :: reference(),
           options = []          :: [option()],
           notify = []           :: [pid()],
-          awaiting_all = []     :: [{pid(), reference() | async}],
+          awaiting_all = []     :: [{pid(), gen_server:reply_tag() | async}],
           answer                :: locking | waiting | done,
           deadlocks = []        :: deadlocks(),
           have_all = false      :: boolean(),

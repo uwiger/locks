@@ -151,6 +151,7 @@ handler(Fd, Trace, _, {Tp,Diff,PMap} = Acc) ->
 
 -define(CHAR_MAX, 60).
 
+-dialyzer({nowarn_function, print/7}).
 print(Fd, N, Mod, L, E, St, T) ->
     Tstr = io_lib:fwrite("~w", [T]),
     Indent = iolist_size(Tstr) + 3,
@@ -165,6 +166,7 @@ print_tail(St, Mod, Col) ->
     Cs = pp(St, Col+1, Mod),
     [{put_chars, unicode, [lists:duplicate(Col,$\s), Cs]}, nl].
 
+-dialyzer({nowarn_function, pp/3}).
 pp(Term, Col, Mod) ->
     io_lib_pretty:print(pp_term(Term),
                         [{column, Col},

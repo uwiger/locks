@@ -21,6 +21,8 @@
 
 -type lock_id()  :: {oid() | '_', node()}.
 
+-type claim_no() :: non_neg_integer().
+
 -type obj()      :: {oid(), mode()}
 		  | {oid(), mode(), where()}
 		  | {oid(), mode(), where(), req()}.
@@ -37,7 +39,11 @@
 -type deadlocks() :: [lock_id()].
 
 -type lock_status() :: have_all_locks | have_none.
--type lock_result()  :: {lock_status(), deadlocks()}.
+-type lock_result()  :: {lock_status(), deadlocks()}
+                      | {abort, {deadlock, deadlocks()}}.
+
+-type lock_status_msg() :: #{ claim_no := claim_no()
+                            , status   := lock_result() }.
 
 -type locktype() :: direct | indirect.
 
