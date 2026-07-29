@@ -177,15 +177,21 @@ pp_term(D) when element(1,D) == dict ->
     try {'$dict', dict:to_list(D)}
     catch
         error:_ ->
-            list_to_tuple([pp_term(T) || T <- tuple_to_list(D)])
+            list_to_tuple(pp_term_l(tuple_to_list(D)))
     end;
 pp_term(T) when is_tuple(T) ->
-    list_to_tuple([pp_term(Trm) || Trm <- tuple_to_list(T)]);
+    list_to_tuple(pp_term_l(tuple_to_list(T)));
 pp_term(L) when is_list(L) ->
-    [pp_term(T) || T <- L];
+    pp_term_l(L);
 pp_term(T) ->
     T.
 
+pp_term_l([H|T]) when is_list(T) ->
+    [pp_term(H) | pp_term_l(T)];
+pp_term_l([H|T]) ->
+    [pp_term(H)|pp_term(T)];
+pp_term_l([]) ->
+    [].
 
 
 tdiff(_, 0) -> 0;

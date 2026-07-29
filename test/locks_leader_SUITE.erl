@@ -25,6 +25,7 @@
          connect_nodes/1,
          disconnect_nodes/1,
          unbar_nodes/0,
+         allow/1,
          leader_nodes/1,
          same_leaders/1]).
 
@@ -233,7 +234,17 @@ gdict_netsplit(Config) ->
 gdict_netsplit_(Config) ->
     Name = [?MODULE, ?LINE],
     [A,B|[C|_] = Rest] = Ns = get_slave_nodes(Config),
+    %% Explicit mesh setup (do not rely on residual connectivity from a
+    %% previous test case). With dist_auto_connect=once, barred links from
+    %% earlier disconnects must be cleared before re-connecting.
+    proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
+    proxy_multicall(Ns, ?MODULE, connect_nodes, [Ns]),
+    [begin
+         Expected = lists:sort(Ns -- [N]),
+         Expected = lists:sort(call_proxy(N, erlang, nodes, []))
+     end || N <- Ns],
     proxy_multicall([A,B], ?MODULE, disconnect_nodes, [Rest]),
+    proxy_multicall(Rest, ?MODULE, disconnect_nodes, [[A,B]]),
     [B] = call_proxy(A, erlang, nodes, []),
     [A] = call_proxy(B, erlang, nodes, []),
     locks_ttb:event({?LINE, netsplit_ready}),
@@ -340,6 +351,8 @@ perform(rejoin, {A, B} = Arg, #{ islands := Isls } = St) ->
     proxy_multicall(ANodes, ?MODULE, connect_nodes, [BNodes]),
     NewIslands = [ A ++ B | (Isls -- [A, B]) ],
     ct:log("rejoined ~p -> ~p", [Arg, NewIslands]),
+    %% Let election/sync settle before further splits or checks.
+    timer:sleep(100),
     St#{ islands => NewIslands };
 perform(add, {Node, Island} = Arg, #{ islands := Isls
                                     , idle := Idle
@@ -360,7 +373,15 @@ perform(update, Arg, St) ->
 perform(check, [{N,_}|_] = I, St) ->
     ct:log("check: I = ~p", [I]),
     Dicts = [D || {_,D} <- I],
-    true = ?retry(true, call_proxy(N, ?MODULE, same_leaders, [Dicts])),
+    %% Patient retry: after rejoins, candidates may still be in safe_loop /
+    %% leader_uncertain while re-electing. same_leaders uses info calls that
+    %% are answered even in safe_loop (unlike arbitrary gdict ops).
+    true = retry(fun() ->
+                         case call_proxy(N, ?MODULE, same_leaders, [Dicts]) of
+                             true -> true;
+                             Other -> error({badmatch, {false, Other}})
+                         end
+                 end, 50),
     St.
 
 next_cmd(St) ->
@@ -434,8 +455,7 @@ with_trace(F, Config, Name) ->
                         , opts => Opts
                         , nodes => Nodes }} | Config])
     catch
-        error:R ->
-            Stack = erlang:get_stacktrace(),
+        error:R:Stack ->
             ttb_stop(),
             ct:log("Error ~p; Stack = ~p~n", [R, Stack]),
             erlang:error(R);
@@ -487,11 +507,17 @@ retry(_, _, Last) ->
     Last.
 
 disconnect_nodes(Ns) ->
-    [{true,_} = {erlang:disconnect_node(N), N} || N <- Ns, N =/= node()],
+    _ = [erlang:disconnect_node(N) || N <- Ns, N =/= node()],
     ok.
 
 unbar_nodes() ->
     gen_server:call(net_kernel, unbar_all).
+
+%% Clear barred-connection entries for the given nodes (dist_auto_connect once).
+%% Only unbar the named peers so other intentional islands stay isolated.
+allow(Ns) ->
+    _ = [ets:match_delete(sys_dist, {barred_connection, N}) || N <- Ns],
+    ok.
 
 connect_nodes(Ns) ->
     [{true,_} = {net_kernel:connect_node(N), N} || N <- Ns, N =/= node()],
@@ -502,10 +528,13 @@ leader_nodes(Ds) ->
     [node(locks_leader:info(D, leader)) || D <- Ds].
 
 same_leaders(Ds) ->
-    Nodes = leader_nodes(Ds),
-    case lists:usort(Nodes) of
-        [_] -> true;
-        _   -> false
+    %% Prefer leader info (handled in safe_loop) over wait_for_dicts, which
+    %% issues gdict calls that can block for the full gen_server timeout while
+    %% a candidate is electing.
+    Leaders = [locks_leader:info(D, leader) || D <- Ds],
+    case lists:usort(Leaders) of
+        [L] when is_pid(L) -> true;
+        _ -> false
     end.
 
 -define(PROXY, locks_leader_test_proxy).
@@ -535,8 +564,10 @@ call_proxy(N, M, F, A) ->
             error({proxy_died, N, Reason});
         {Ref, Result} ->
             Result
-    after 1000 ->
-            error(proxy_call_timeout)
+    after 10000 ->
+            %% Generous timeout: same_leaders/wait_for_dicts may block on
+            %% gen_server calls while leaders re-elect after netsplits.
+            error({proxy_call_timeout, N, M, F})
     end.
 
 get_slave_nodes(Config) ->
@@ -556,29 +587,46 @@ start_slave(Name) ->
             ok
     end,
     {Pa, Pz} = paths(),
-    Paths = "-pa ./ -pz ../ebin" ++
-        lists:flatten([[" -pa " ++ Path || Path <- Pa],
-                       [" -pz " ++ Path || Path <- Pz]]),
-    Arg = " -kernel dist_auto_connect once",
-    {ok, Node} = ct_slave:start(host(), Name, [{erl_flags, Paths ++ Arg}]),
+    Args = lists:append(
+             [["-pa", "./"], ["-pz", "../ebin"]]
+             ++ [["-pa", Path] || Path <- Pa]
+             ++ [["-pz", Path] || Path <- Pz]
+             ++ [%% OTP 25+: global disconnects nodes that would form
+                 %% overlapping partitions. That fights intentional netsplit
+                 %% tests, so disable it on peers.
+                 ["-kernel", "dist_auto_connect", "once"],
+                 ["-kernel", "prevent_overlapping_partitions", "false"]]),
+    %% standard_io control connection so we can drop/replace the dist
+    %% link (hidden connect) without peer killing the node.
+    {ok, Peer, Node} = peer:start(#{name => Name,
+                                    args => Args,
+                                    connection => standard_io}),
     {module,net_kernel} = rpc:call(Node, ?MODULE, patch_net_kernel, []),
-    disconnect_node(Node),
+    _ = erlang:disconnect_node(Node),
     true = net_kernel:hidden_connect_node(Node),
     spawn(Node, ?MODULE, proxy, []),
-    {Node, rpc:call(Node, os, getpid, [])}.
+    {Node, Peer}.
 
 stop_slaves(Ns) ->
     [ok = stop_slave(N) || N <- Ns],
     ok.
 
-stop_slave({N, Pid}) ->
+stop_slave({N, Peer}) when is_pid(Peer) ->
+    try peer:stop(Peer)
+    catch
+        _:_ ->
+            stop_slave_halt(N)
+    end;
+stop_slave({N, _OsPid}) ->
+    stop_slave_halt(N).
+
+stop_slave_halt(N) ->
     try erlang:monitor_node(N, true) of
         true ->
             rpc:call(N, erlang, halt, []),
             receive
                 {nodedown, N} -> ok
             after 10000 ->
-                    os:cmd("kill -9 " ++ Pid),
                     ok
             end
     catch
@@ -607,7 +655,7 @@ patch_net_kernel() ->
     NetKernel = code:which(net_kernel),
     {ok, {_,[{abstract_code,
               {raw_abstract_v1,
-               [{attribute,1,file,_}|Forms]}}]}} =
+               [{attribute,{1,1},file,_}|Forms]}}]}} =
         beam_lib:chunks(NetKernel, [abstract_code]),
     NewForms = xform_net_kernel(Forms),
     try
@@ -617,9 +665,9 @@ patch_net_kernel() ->
     locks_ttb:event({?LINE, net_kernel, NewForms}),
     Res
     catch
-        error:What ->
+        error:What:ST ->
             io:fwrite(user, "~p: ERROR:~p~n", [?LINE, What]),
-            error({What, erlang:get_stacktrace()})
+            error({What, ST})
     end.
 
 xform_net_kernel({function,L,handle_call,3,Clauses}) ->

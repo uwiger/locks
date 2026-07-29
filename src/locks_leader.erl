@@ -569,6 +569,14 @@ safe_loop(#st{agent = A} = S) ->
             ?log(_Msg, S),
             ?event({in_safe_loop, _Msg}, S),
             noreply(sync_requested(L, Type, ERef, S));
+        {?MODULE, sync_lock_ok, Worker} = _Msg ->
+            ?log(_Msg, S),
+            ?event(_Msg, S),
+            noreply(sync_lock_acquired(Worker, S));
+        {?MODULE, sync_lock_failed, Worker} = _Msg ->
+            ?log(_Msg, S),
+            ?event(_Msg, S),
+            noreply(sync_lock_aborted(Worker, S));
         {'$gen_call', From, '$locks_leader_debug'} = _Msg ->
             ?log(_Msg, S),
             handle_call('$locks_leader_debug', From, S);
@@ -650,6 +658,12 @@ handle_info_({?MODULE, ensure_sync, Pid, Type, _ERef} = _Msg, #st{} = S) ->
                  S
          end,
     noreply(S1);
+handle_info_({?MODULE, sync_lock_ok, Worker} = _Msg, S) ->
+    ?event(_Msg, S),
+    noreply(sync_lock_acquired(Worker, S));
+handle_info_({?MODULE, sync_lock_failed, Worker} = _Msg, S) ->
+    ?event(_Msg, S),
+    noreply(sync_lock_aborted(Worker, S));
 handle_info_({?MODULE, am_worker, W} = _Msg, #st{} = S) ->
     ?event({handle_info, _Msg}, S),
     noreply(worker_announced(W, S));
@@ -929,7 +943,82 @@ become_leader(#st{agent = A} = S) ->
             ?event(vector_questions_leader, S2),
             set_leader_uncertain(S2);
         _ ->
-            become_leader_(S2)
+            get_leader_sync_lock(S2)
+    end.
+
+get_leader_sync_lock(#st{lock = Lock, nodes = Nodes} = St) ->
+    %% Serialize become_leader_ among competing leaders on the currently
+    %% reachable set of candidate nodes (all_alive, matching the main
+    %% leader lock). abort_on_deadlock ensures that if two leaders in a
+    %% connected component race, all but one abort and revert to
+    %% leader_uncertain instead of deadlocking while merging state.
+    %%
+    %% Acquisition runs in a helper process so this gen_server stays
+    %% responsive (info/calls) while waiting for the sync lock.
+    case get({?MODULE, sync_lock_worker}) of
+        undefined ->
+            Me = self(),
+            Worker = spawn(fun() -> sync_lock_proc(Me, Lock, Nodes) end),
+            put({?MODULE, sync_lock_worker}, Worker),
+            St;
+        _Pending ->
+            St
+    end.
+
+sync_lock_proc(Leader, Lock, Nodes) ->
+    [?MODULE, Resource] = Lock,
+    SyncLock = [?MODULE, sync, Resource],
+    {ok, Agent} = locks:spawn_agent([{abort_on_deadlock, true},
+                                     {await_nodes, false}]),
+    try locks:lock(Agent, SyncLock, write, Nodes, all_alive) of
+        {ok, _} ->
+            Leader ! {?MODULE, sync_lock_ok, self()},
+            %% Hold the lock until the leader finishes become_leader_,
+            %% so competing candidates stay blocked out of the merge.
+            receive
+                {?MODULE, sync_lock_release, Leader} -> ok
+            after 60000 ->
+                    ok
+            end
+    catch
+        error:_ ->
+            Leader ! {?MODULE, sync_lock_failed, self()}
+    after
+        case is_process_alive(Agent) of
+            true  -> _ = (catch locks:end_transaction(Agent));
+            false -> ok
+        end
+    end.
+
+sync_lock_acquired(Worker, St) ->
+    case erase({?MODULE, sync_lock_worker}) of
+        Worker ->
+            try become_leader_(St)
+            after
+                Worker ! {?MODULE, sync_lock_release, self()}
+            end;
+        Other ->
+            %% Stale or unexpected worker; drop the lock and stay uncertain.
+            Worker ! {?MODULE, sync_lock_release, self()},
+            case Other of
+                undefined -> ok;
+                Prev when is_pid(Prev) ->
+                    put({?MODULE, sync_lock_worker}, Prev)
+            end,
+            St
+    end.
+
+sync_lock_aborted(Worker, St) ->
+    case erase({?MODULE, sync_lock_worker}) of
+        Worker ->
+            set_leader_uncertain(St);
+        Other ->
+            case Other of
+                undefined -> ok;
+                Prev when is_pid(Prev) ->
+                    put({?MODULE, sync_lock_worker}, Prev)
+            end,
+            St
     end.
 
 become_leader_(#st{election_ref = {L,_,_}, mod = M, mod_state = MSt,
@@ -1113,6 +1202,11 @@ do_ensure_sync(Pid, Type, S) ->
     maybe_announce_leader(Pid, Type, remove_synced(Pid, Type, S)).
 
 set_leader_uncertain(#st{agent = A} = S) ->
+    case erase({?MODULE, sync_lock_worker}) of
+        undefined -> ok;
+        Worker when is_pid(Worker) ->
+            Worker ! {?MODULE, sync_lock_release, self()}
+    end,
     send_all(S, {?MODULE, leader_uncertain, self(),
                  S#st.synced, S#st.synced_workers}),
     locks_agent:async_await_all_locks(A),

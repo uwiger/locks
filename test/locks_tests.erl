@@ -361,7 +361,7 @@ script(Agents, S) ->
     io:fwrite(user, "=== Agent pids: ~p~n", [AgentPids]),
     try eval_script(S, AgentPids)
     after
-        dbg:stop_clear(),
+        dbg:stop(),
         [kill_client(C) || {_, C, _, _} <- AgentPids]
     end.
 
@@ -458,8 +458,7 @@ eval_script([E|S], Agents, Acc) ->
     {Res, Agents1} =
         try  ask_agent(E, Agents, Acc)
         catch
-            error:Reason ->
-                Stack = erlang:get_stacktrace(),
+            error:Reason:Stack ->
                 io:fwrite(user, ("ERROR: ~p~n"
                                  "Script: ~p~n"
                                  "Trace: ~p~n"),
@@ -625,6 +624,22 @@ stop_slaves(Ns) ->
     ok.
 
 stop_slave(N) ->
+    try stop_slave_(N)
+    after
+        delete_peer_pid(N)
+    end.
+
+stop_slave_(N) ->
+    case get_peer_pid(N) of
+        undefined ->
+            stop_slave_halt(N);
+        Peer when is_pid(Peer) ->
+            try peer:stop(Peer)
+            catch _:_ -> stop_slave_halt(N)
+            end
+    end.
+
+stop_slave_halt(N) ->
     try erlang:monitor_node(N, true) of
 	true ->
 	    rpc:call(N, erlang, halt, []),
@@ -634,6 +649,8 @@ stop_slave(N) ->
 		    erlang:error(timeout)
 	    end
     catch
+        error:notalive ->
+            ok;
 	error:badarg ->
 	    ok
     end.
@@ -647,12 +664,20 @@ start_slave(Name) ->
             ok
     end,
     {Pa, Pz} = paths(),
-    Paths = "-pa ./ -pz ../ebin" ++
-        lists:flatten([[" -pa " ++ Path || Path <- Pa],
-		       [" -pz " ++ Path || Path <- Pz]]),
-    {ok, Node} = slave:start(host(), Name, Paths),
+    Args = lists:append([["-pa", "./"], ["-pz", "../ebin"]]
+                        ++ [["-pa", Path] || Path <- Pa]
+                        ++ [["-pz", Path] || Path <- Pz]),
+    {ok, Peer, Node} = peer:start(#{name => Name, args => Args}),
+    save_peer_pid(Node, Peer),
     %% io:fwrite(user, "Slave node: ~p~n", [Node]),
     Node.
+
+save_peer_pid(Node, Pid) ->
+    persistent_term:put({?MODULE, peer_pid, Node}, Pid).
+get_peer_pid(Node) ->
+    persistent_term:get({?MODULE, peer_pid, Node}, undefined).
+delete_peer_pid(Node) ->
+    persistent_term:erase({?MODULE, peer_pid, Node}).
 
 paths() ->
     Path = code:get_path(),
