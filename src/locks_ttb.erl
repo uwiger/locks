@@ -26,6 +26,11 @@ default_patterns() ->
     [{locks_agent , event, 3, []},
      {locks_server, event, 3, []},
      {locks_leader, event, 3, []},
+     %% Society plane (pg-based candidate discovery)
+     {locks_pg    , join, 2, []},
+     {locks_pg    , leave, 2, []},
+     {locks_pg    , monitor, 1, []},
+     {locks_pg    , get_members, 1, []},
      {?MODULE     , event, 3, []}].
 
 default_flags() ->
