@@ -178,14 +178,12 @@ broadcast(Msg, #st{leader = L} = S) when L == self() ->
 broadcast(_, _) ->
     error(not_leader).
 
-broadcast(Msg, ToPids, #st{ leader = L
-                          , synced = Cands
-                          , synced_workers = Ws}) when L == self() ->
-    case (ToPids -- Cands) -- Ws of
-        [] -> ok;
-        Pids ->
-            _ = do_broadcast_(Pids, Msg)
-    end;
+%% Send `Msg` as a from_leader payload to the given candidate/worker pids.
+%% (Unlike broadcast/2 this targets a subset; used e.g. by gproc_dist sync.)
+broadcast(Msg, ToPids, #st{leader = L, election_ref = ERef})
+  when L == self(), is_list(ToPids) ->
+    do_broadcast_(ToPids, msg(from_leader, ERef, Msg)),
+    ok;
 broadcast(_, _, _) ->
     error(not_leader).
 
@@ -1009,14 +1007,13 @@ remove_synced(Pid, candidate, #st{synced = Synced} = S) ->
     S#st{synced = Synced -- [Pid]}.
 
 maybe_remove_cand(candidate, Pid, #st{candidates = Cs, synced = Synced,
-                                      leader = L, mod = M,
-                                      mod_state = MSt} = S) ->
+                                      mod = M, mod_state = MSt} = S) ->
+    %% Always invoke handle_DOWN (not only when we are leader). When the
+    %% current leader dies we clear leader before this runs, so a
+    %% leader-only guard would skip cleanup entirely (gproc_dist relies
+    %% on it to drop globals for the dead node).
     S1 = S#st{candidates = Cs -- [Pid], synced = Synced -- [Pid]},
-    if L == self() ->
-            apply_cb(M:handle_DOWN(Pid, MSt, opaque(S1)), S1);
-       true ->
-            S1
-    end;
+    apply_cb(M:handle_DOWN(Pid, MSt, opaque(S1)), S1);
 maybe_remove_cand(worker, Pid, #st{workers = Ws} = S) ->
     S#st{workers = Ws -- [Pid]}.
 
