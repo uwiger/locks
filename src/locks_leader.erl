@@ -1097,8 +1097,10 @@ from_leader(OtherL, _ERef, _Msg, S) ->
 
 leader_announced(L, ERef, Msg, #st{election_ref = ERef,
                                    mod = M, mod_state = MSt} = S) ->
-    apply_cb(M:surrendered(MSt, Msg, opaque(S)),
-             S#st{leader = L, synced = [], synced_workers = []});
+    %% Pass election with leader already set so callbacks (e.g. gproc_dist
+    %% notify_role) can read leader_node/1.
+    S2 = S#st{leader = L, synced = [], synced_workers = []},
+    apply_cb(M:surrendered(MSt, Msg, opaque(S2)), S2);
 leader_announced(L, ERef, Msg, #st{mod = M, mod_state = MSt} = S) ->
     #st{vector = V} = S1 = refresh_vector(S),
     {_, _, Vl} = ERef,
@@ -1106,7 +1108,7 @@ leader_announced(L, ERef, Msg, #st{mod = M, mod_state = MSt} = S) ->
         true ->
             S2 = S1#st{leader = L, election_ref = ERef,
                        synced = [], synced_workers = []},
-            apply_cb(M:surrendered(MSt, Msg, opaque(S1)), S2);
+            apply_cb(M:surrendered(MSt, Msg, opaque(S2)), S2);
         false ->
             set_leader_uncertain(S1)
     end.
