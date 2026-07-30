@@ -356,10 +356,18 @@ start_incremental(N, Alive, Rest, Name) ->
     insert_initial(D, Alive),
     NewAlive = [{N, D}|Alive],
     Dicts = [D1 || {_, D1} <- NewAlive],
-    Vals = [{D1, ?retry({ok,1}, gdict:find(a, D1))} || D1 <- Dicts],
-    ct:log("Values = ~p~n", [Vals]),
+    %% Consensus first (election/surrender), then state visibility — looking
+    %% up before a shared leader exists only observes empty local dicts.
     Leaders = wait_same_leader(Dicts),
     ct:log("Leaders after joining ~p = ~p~n", [N, Leaders]),
+    [begin
+         {ok, 1} = retry(fun() ->
+                                 case gdict:find(a, D1) of
+                                     {ok, 1} = Ok -> Ok;
+                                     Other -> error({badmatch, {find_a, Other}})
+                                 end
+                         end, ?WAIT_TRIES)
+     end || D1 <- Dicts],
     start_incremental(Rest, NewAlive, Name).
 
 %% Scripted late join: stabilize N=3 with shared state, then bring a 4th
@@ -599,10 +607,19 @@ ttb_stop() ->
     ct:log("Event timeline in ~s (raw dir ~s)~n", [Out, Dir]).
 
 
+%% Mesh the new node with every live peer. net_kernel:connect/1 is gone on
+%% modern OTP (only connect_node/1); a silent undef left incremental joins
+%% isolated so the joiner elected alone with an empty dict.
 maybe_connect(_, []) ->
     ok;
-maybe_connect(N, [{N1,_}|_]) ->
-    call_proxy(N, net_kernel, connect, [N1]).
+maybe_connect(N, Alive) ->
+    PeerNs = [N1 || {N1, _} <- Alive],
+    %% Full mesh: new → all peers, each peer → new (dist_auto_connect once).
+    ok = call_proxy(N, ?MODULE, connect_nodes, [PeerNs]),
+    [ok = call_proxy(P, ?MODULE, connect_nodes, [[N]]) || P <- PeerNs],
+    Expected = lists:sort(PeerNs),
+    Expected = lists:sort(call_proxy(N, erlang, nodes, [])),
+    ok.
 
 insert_initial(D, []) ->
     gdict:store(a, 1, D);
