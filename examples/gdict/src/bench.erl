@@ -30,10 +30,10 @@ simple_locks(_, _, 0, Iter0, Tab) ->
       end, ets:tab2list(Tab)).
 
 simple_locks_i(Begin, End, Tab) ->
-    {A, {ok,[]}} = locks:begin_transaction(),
+    {A, {have_all_locks, []}} = locks:begin_transaction(),
     loop(Begin, End,
 	 fun(N1) ->
-		 {Time, {ok,[]}} =
+		 {Time, {ok, []}} =
 		     timer:tc(locks, lock, [A, [?MODULE, N1], write]),
 		 Time
 	 end, Tab),
