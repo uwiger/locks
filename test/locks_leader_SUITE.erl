@@ -42,6 +42,9 @@
                                         __E
                                 end, 10)).
 -define(NOT(Expr), {'$not', Expr}).
+%% Post-election / post-heal waits: 100ms * N. CI (esp. OTP 29) has seen
+%% merge take ~6s after a 3-node heal; keep margin above that.
+-define(WAIT_TRIES, 100).
 
 all() ->
     %% Structured netsplit / heal / incremental tests define "green".
@@ -243,7 +246,7 @@ wait_same_leader_nodes(Node, Dicts) ->
                       Other ->
                           error({badmatch, {leader_nodes, Other}})
                   end
-          end, 50).
+          end, ?WAIT_TRIES).
 
 %% Wait until candidates answer local calls (out of pure bootstrap).
 wait_for_dicts(Dicts) ->
@@ -262,7 +265,7 @@ wait_same_leader(Dicts) ->
                       Other ->
                           error({badmatch, {leaders, Other}})
                   end
-          end, 50).
+          end, ?WAIT_TRIES).
 
 %% After a split: every dict has some pid leader (possibly different).
 wait_partition_leaders(Dicts) ->
@@ -272,7 +275,7 @@ wait_partition_leaders(Dicts) ->
                       true  -> Ls;
                       false -> error({badmatch, {leaders, Ls}})
                   end
-          end, 50).
+          end, ?WAIT_TRIES).
 
 gdict_netsplit(Config) ->
     with_trace(fun gdict_netsplit_/1, Config, "leader_tests_netsplit").
@@ -574,10 +577,13 @@ with_trace(F, Config, Name) ->
         error:R:Stack ->
             ttb_stop(),
             ct:log("Error ~p; Stack = ~p~n", [R, Stack]),
-            erlang:error(R);
-        exit:R ->
+            %% Preserve original stack — erlang:error(R) rewrote it to here
+            %% and hid the real function_clause/badmatch site (OTP 29 CI).
+            erlang:raise(error, R, Stack);
+        exit:R:Stack ->
             ttb_stop(),
-            exit(R)
+            ct:log("Exit ~p; Stack = ~p~n", [R, Stack]),
+            erlang:raise(exit, R, Stack)
     end,
     ttb_stop(),
     ok.
@@ -620,7 +626,9 @@ retry(F, N, _) when N > 0 ->
             retry(F, N-1, Other)
     end;
 retry(_, _, Last) ->
-    Last.
+    %% Do not return Last: callers like lists:usort(Last) then fail with
+    %% opaque function_clause. Surface the last observed value clearly.
+    error({retry_exhausted, Last}).
 
 disconnect_nodes(Ns) ->
     _ = [erlang:disconnect_node(N) || N <- Ns, N =/= node()],
