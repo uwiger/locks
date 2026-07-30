@@ -3,3 +3,9 @@ deps
 *.o
 *.beam
 *.plt
+_build
+.rebar3
+*.[eh]rl~
+# ttb writes this in CWD when tracing (also under _build/test/logs/)
+ttb_last_config
+rebar3.crashdump

@@ -1,6 +1,6 @@
-{application, examples,
+{application, gdict,
  [
-  {description, ""},
+  {description, "Dict-based demo application for locks_leader"},
   {vsn, "1"},
   {registered, []},
   {applications, [

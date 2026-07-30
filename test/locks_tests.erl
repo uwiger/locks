@@ -14,7 +14,7 @@
 -module(locks_tests).
 
 -include_lib("eunit/include/eunit.hrl").
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -import(lists,[map/2]).
 
@@ -31,6 +31,7 @@ run_test_() ->
        ?_test(simple_lock())
        , ?_test(one_lock_two_clients())
        , ?_test(one_lock_wrr_clients())
+       , ?_test(three_locks_three_clients())
        , ?_test(lock_merge())
        , ?_test(lock_upgrade1())
        , ?_test(lock_upgrade2())
@@ -86,6 +87,50 @@ one_lock_two_clients() ->
             {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
             {2, ?LINE, ?MODULE, client_result, [], match({ok, []})},
             {2, ?LINE, ?MODULE, kill_client, [], match(ok)}]).
+
+three_locks_three_clients() ->
+    L1 = [?MODULE, ?LINE, l1],
+    L2 = [?MODULE, ?LINE, l2],
+    L3 = [?MODULE, ?LINE, l3],
+    Match = fun(normal, {have_all_locks,_}) -> ok;
+               (timeout, timeout ) -> ok
+            end,
+    SMatch = fun(normal, {have_all_locks,_}) -> ok;
+                (normal, waiting           ) -> ok
+             end,
+    script([1,2,3],
+           [{1, ?LINE, locks, lock, ['$agent', L1, write], match({ok,[]})},
+            {1, ?LINE, locks, lock, ['$agent', L2, write], match({ok,[]})},
+            {2, ?LINE, locks, lock_nowait, ['$agent', L2, write], match(ok)},
+            {1, ?LINE, locks, lock_nowait, ['$agent', L3, write], match(ok)},
+            {3, ?LINE, locks, lock_nowait, ['$agent', L3, write], match(ok)},
+            {2, ?LINE, locks, lock_nowait, ['$agent', L3, write], match(ok)},
+            {3, ?LINE, locks, lock_nowait, ['$agent', L1, write], match(ok)},
+            {2, ?LINE, locks, lock_nowait, ['$agent', L1, write], match(ok)},
+            %%
+            {1, ?LINE, locks, await_all_locks, ['$agent'], 100, Match},
+            %% The next command must not get the same result as the previous.
+            {2, ?LINE, locks, transaction_status, ['$agent'], 100,
+             'ALL'([SMatch, 'NEQ'('V'(-1))])},
+            %%
+            %% At this point, end the first two transactions
+            %%
+            {1, ?LINE, locks, end_transaction, ['$agent'], match(ok)},
+
+            {2, ?LINE, locks, end_transaction, ['$agent'], match(ok)},
+            %%
+            %% Now try to let 3 acquire last lock and finish
+            %%
+            {3, ?LINE, locks, await_all_locks, ['$agent'],
+             match({have_all_locks, []})},
+            {3, ?LINE, locks, lock, ['$agent', L2, write], match({ok,[]})},
+            {3, ?LINE, locks, await_all_locks, ['$agent'],
+             match({have_all_locks, []})},
+            %%
+            {1, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {2, ?LINE, ?MODULE, kill_client, [], match(ok)},
+            {3, ?LINE, ?MODULE, kill_client, [], match(ok)}
+           ]).
 
 one_lock_wrr_clients() ->
     L = [?MODULE, ?LINE],
@@ -192,10 +237,10 @@ two_w_locks_parent_read_deadlock() ->
        {1,?LINE, locks,lock, ['$agent',L0,read], 100, match(timeout,timeout)},
        {2,?LINE, locks,lock, ['$agent',L0,read], 100, match(timeout,timeout)},
        {1, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_,_,_]}) -> ok end},
+        fun(normal, {ok, [_|_]}) -> ok end},
        {1,?LINE, ?MODULE, kill_client, [], match(ok)},
        {2, ?LINE, ?MODULE, client_result, [],
-        fun(normal, {ok, [_,_,_]}) -> ok end},
+        fun(normal, {ok, [_|_]}) -> ok end},
        {2,?LINE, ?MODULE, kill_client, [], match(ok)}
       ]).
 
@@ -316,7 +361,7 @@ script(Agents, S) ->
     io:fwrite(user, "=== Agent pids: ~p~n", [AgentPids]),
     try eval_script(S, AgentPids)
     after
-        dbg:stop_clear(),
+        dbg:stop(),
         [kill_client(C) || {_, C, _, _} <- AgentPids]
     end.
 
@@ -413,8 +458,7 @@ eval_script([E|S], Agents, Acc) ->
     {Res, Agents1} =
         try  ask_agent(E, Agents, Acc)
         catch
-            error:Reason ->
-                Stack = erlang:get_stacktrace(),
+            error:Reason:Stack ->
                 io:fwrite(user, ("ERROR: ~p~n"
                                  "Script: ~p~n"
                                  "Trace: ~p~n"),
@@ -580,6 +624,22 @@ stop_slaves(Ns) ->
     ok.
 
 stop_slave(N) ->
+    try stop_slave_(N)
+    after
+        delete_peer_pid(N)
+    end.
+
+stop_slave_(N) ->
+    case get_peer_pid(N) of
+        undefined ->
+            stop_slave_halt(N);
+        Peer when is_pid(Peer) ->
+            try peer:stop(Peer)
+            catch _:_ -> stop_slave_halt(N)
+            end
+    end.
+
+stop_slave_halt(N) ->
     try erlang:monitor_node(N, true) of
 	true ->
 	    rpc:call(N, erlang, halt, []),
@@ -589,6 +649,8 @@ stop_slave(N) ->
 		    erlang:error(timeout)
 	    end
     catch
+        error:notalive ->
+            ok;
 	error:badarg ->
 	    ok
     end.
@@ -602,12 +664,20 @@ start_slave(Name) ->
             ok
     end,
     {Pa, Pz} = paths(),
-    Paths = "-pa ./ -pz ../ebin" ++
-        lists:flatten([[" -pa " ++ Path || Path <- Pa],
-		       [" -pz " ++ Path || Path <- Pz]]),
-    {ok, Node} = slave:start(host(), Name, Paths),
+    Args = lists:append([["-pa", "./"], ["-pz", "../ebin"]]
+                        ++ [["-pa", Path] || Path <- Pa]
+                        ++ [["-pz", Path] || Path <- Pz]),
+    {ok, Peer, Node} = peer:start(#{name => Name, args => Args}),
+    save_peer_pid(Node, Peer),
     %% io:fwrite(user, "Slave node: ~p~n", [Node]),
     Node.
+
+save_peer_pid(Node, Pid) ->
+    persistent_term:put({?MODULE, peer_pid, Node}, Pid).
+get_peer_pid(Node) ->
+    persistent_term:get({?MODULE, peer_pid, Node}, undefined).
+delete_peer_pid(Node) ->
+    persistent_term:erase({?MODULE, peer_pid, Node}).
 
 paths() ->
     Path = code:get_path(),

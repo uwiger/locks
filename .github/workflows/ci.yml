@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [master, 'uw-*']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: OTP ${{ matrix.otp }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ['27', '28', '29']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          # Latest rebar3 tracks OTP releases; pin only if a matrix leg breaks.
+          rebar3-version: '3.25'
+
+      - name: Cache Hex / rebar3
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/rebar3
+            ~/.hex
+          key: ${{ runner.os }}-otp${{ matrix.otp }}-rebar3-${{ hashFiles('rebar.lock', 'rebar.config') }}
+          restore-keys: |
+            ${{ runner.os }}-otp${{ matrix.otp }}-rebar3-
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Dialyzer
+        run: rebar3 dialyzer
+
+      - name: Dialyzer (test profile)
+        # Suites + gdict example apps; plt_extra_apps include ct/eunit/tools.
+        run: rebar3 as test dialyzer
+
+      - name: EUnit
+        run: rebar3 eunit
+
+      - name: Common Test
+        # Structured suite only (random_netsplits is quarantined / ape).
+        # peer nodes need epmd; the suite starts it if needed, but ensure
+        # the daemon is up before the first peer:start/1.
+        run: |
+          epmd -daemon
+          rebar3 ct
+
+      - name: Upload CT logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-logs-otp-${{ matrix.otp }}
+          path: |
+            _build/test/logs
+          if-no-files-found: ignore
+          retention-days: 14

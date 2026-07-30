@@ -39,6 +39,7 @@
     lock_nowait/4,
     lock_objects/2,       %% (Agent, Objects)
     await_all_locks/1,    %% (Agent)
+    transaction_status/1, %% (Agent)
     watch/2,              %% (OID, Nodes)
     unwatch/2,            %% (OID, Nodes)
     watchers/1,           %% (OID)
@@ -190,6 +191,24 @@ lock_objects(Agent, Objects) ->
 %% @end
 await_all_locks(Agent) ->
     locks_agent:await_all_locks(Agent).
+
+%% @doc Inquire about the current status of the transaction.
+%% Return values:
+%% <dl>
+%% <dt>`no_locks'</dt>
+%%   <dd>No locks have been requested</dd>
+%% <dt>`{have_all_locks, Deadlocks}'</dt>
+%%   <dd>All requested locks have been claimed, `Deadlocks' indicates whether
+%%       any deadlocks were resolved in the process.</dd>
+%% <dt>`waiting'</dt>
+%%   <dd>Still waiting for some locks.</dd>
+%% <dt>`{cannot_serve, Objs}'</dt>
+%%   <dd>Some lock requests cannot be served, e.g. because some nodes are
+%%       unavailable.</dd>
+%% </dl>
+%% @end
+transaction_status(Agent) ->
+    locks_agent:transaction_status(Agent).
 
 -spec watch(oid(), [node()]) -> ok.
 %% @doc Subscribe to lock state changes.

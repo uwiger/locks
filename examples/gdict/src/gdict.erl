@@ -64,13 +64,13 @@ trace(F) when is_function(F, 0) ->
     F().
 
 new() ->
-    locks_leader:start_link(test_cb, dict:new()).
+    locks_leader:start_link(test_cb, #{}).
 
 new(Name) ->
-    locks_leader:start_link(Name, test_cb, dict:new(), []).
+    locks_leader:start_link(Name, test_cb, #{}, []).
 
 new_opt(Opts) ->
-    locks_leader:start_link(test_cb, dict:new(), Opts).
+    locks_leader:start_link(test_cb, #{}, Opts).
 
 -define(store(Dict,Expr,Legend),
 	locks_leader:leader_call(Dict, {store, fun(D) ->
@@ -84,27 +84,38 @@ new_opt(Opts) ->
 
 %% dict functions that modify state:
 append(Key, Value, Dict) ->
-    ?store(Dict, dict:append(Key,Value,D), append).
+    ?store(Dict, maps_append(Key,Value,D), append).
 append_list(Key, ValList, Dict) ->
-    ?store(Dict, dict:append_list(Key,ValList,D), append_list).
+    ?store(Dict, maps_append_list(Key,ValList,D), append_list).
 erase(Key, Dict) ->
-    ?store(Dict, dict:erase(Key,D), erase).
+    ?store(Dict, maps:remove(Key,D), erase).
 store(Key, Value, Dict) ->
-    ?store(Dict, dict:store(Key,Value,D), store).
+    ?store(Dict, maps:put(Key,Value,D), store).
 update(Key,Function,Dict) ->
-    ?store(Dict, dict:update(Key,Function,D), update).
+    ?store(Dict, maps:update_with(Key,Function,D), update).
 update(Key, Function, Initial, Dict) ->
-    ?store(Dict, dict:update(Key,Function,Initial,D), update).
+    ?store(Dict, maps:update_with(Key,Function,Initial,D), update).
 update_counter(Key, Incr, Dict) ->
-    ?store(Dict, dict:update_counter(Key,Incr,D), update_counter).
+    ?store(Dict, maps_update_counter(Key,Incr,D), update_counter).
 
 %% dict functions that do not modify state (lookup functions)
 %%
-fetch(Key, Dict) ->	 ?lookup(Dict, dict:fetch(Key,D),	fetch).
-fetch_keys(Dict) ->	 ?lookup(Dict, dict:fetch_keys(D),	fetch_keys).
-filter(Pred, Dict) ->	 ?lookup(Dict, dict:filter(Pred,D),	filter).
-find(Key, Dict) ->	 ?lookup(Dict, dict:find(Key,D),	find).
-fold(Fun, Acc0, Dict) -> ?lookup(Dict, dict:fold(Fun,Acc0,D),	fold).
-is_key(Key, Dict) ->	 ?lookup(Dict, dict:is_key(Key,D),	is_key).
-map(Fun, Dict) ->	 ?lookup(Dict, dict:map(Fun,D),		map).
-to_list(Dict) ->	 ?lookup(Dict, dict:to_list(D),		to_list).
+fetch(Key, Dict) ->      ?lookup(Dict, maps:get(Key,D),       fetch).
+fetch_keys(Dict) ->      ?lookup(Dict, maps:keys(D),          fetch_keys).
+filter(Pred, Dict) ->    ?lookup(Dict, maps:filter(Pred,D),   filter).
+find(Key, Dict) ->       ?lookup(Dict, maps:find(Key,D),      find).
+fold(Fun, Acc0, Dict) -> ?lookup(Dict, maps:fold(Fun,Acc0,D), fold).
+is_key(Key, Dict) ->     ?lookup(Dict, maps:is_key(Key,D),    is_key).
+map(Fun, Dict) ->        ?lookup(Dict, maps:map(Fun,D),       map).
+to_list(Dict) ->         ?lookup(Dict, maps:to_list(D),       to_list).
+
+maps_append(Key, Value, D) ->
+    maps_append_list(Key, [Value], D).
+
+maps_append_list(Key, ValList, D) ->
+    L = maps:get(Key, D, []),
+    D#{Key => L ++ ValList}.
+
+maps_update_counter(Key, Incr, D) ->
+    Old = maps:get(Key, D, 0),
+    D#{Key => Old + Incr}.
