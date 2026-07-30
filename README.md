@@ -1,6 +1,6 @@
-
-
 # The locks application #
+
+[![CI](https://github.com/uwiger/locks/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/uwiger/locks/actions/workflows/ci.yml)
 
 __Authors:__ Ulf Wiger ([`ulf@wiger.net`](mailto:ulf@wiger.net)), Thomas Arts ([`thomas@quviq.com`](mailto:thomas@quviq.com)).
 
