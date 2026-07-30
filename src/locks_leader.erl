@@ -35,12 +35,12 @@
 -behaviour(gen_statem).
 
 -export([start_link/2, start_link/3, start_link/4,
-	 call/2, call/3,
-	 cast/2,
-	 leader_call/2,
-	 leader_call/3,
+         call/2, call/3,
+         cast/2,
+         leader_call/2,
+         leader_call/3,
          leader_reply/2,
-	 leader_cast/2,
+         leader_cast/2,
          info/1, info/2]).
 
 -export([callback_mode/0, init/1, terminate/3, code_change/4]).
@@ -48,12 +48,13 @@
 
 -export([candidates/1,
          new_candidates/1,
-	 workers/1,
-	 leader/1,
+         alive/1,
+         workers/1,
+         leader/1,
          leader_node/1]).
 
 -export([reply/2,
-         broadcast/2,
+         broadcast/2, broadcast/3,
          broadcast_to_candidates/2,
          ask_candidates/2]).
 
@@ -72,35 +73,35 @@
 -type server_ref() :: atom() | {atom(), node()} | {global, term()}
                    | {via, module(), term()} | pid().
 -type cb_return() ::
-	{ok, mod_state()}
+        {ok, mod_state()}
       | {ok, msg(), mod_state()}
       | {noreply, mod_state()}
       | {stop, reason(), mod_state()}.
 -type cb_reply() ::
-	{reply, reply(), mod_state()}
+        {reply, reply(), mod_state()}
       | {reply, reply(), msg(), mod_state()}
       | {noreply, mod_state()}
       | {stop, reason(), mod_state()}.
 
 
 -record(st, {
-	  role = candidate        :: candidate | worker,
-	  lock,
-          vector,
-	  agent,
-	  leader,                 %% pid() | undefined — self() only in leader state
-          election_ref,
-	  nodes = ordsets:new(),
-          pg_mref :: reference() | undefined,
-	  candidates = [],
-	  workers = [],
-          synced = [],
-          synced_workers = [],
-          sync_worker :: pid() | undefined,
-	  regname,
-	  mod,
-	  mod_state,
-	  buffered = []           :: [{reference(), from()}]
+             role = candidate :: candidate | worker,
+             lock,
+             vector,
+             agent,
+             leader,         %% pid() | undefined — self() only in leader state
+             election_ref,
+             nodes = ordsets:new(),
+             pg_mref          :: reference() | undefined,
+             candidates = [],
+             workers = [],
+             synced = [],
+             synced_workers = [],
+             sync_worker      :: pid() | undefined,
+             regname,
+             mod,
+             mod_state,
+             buffered = []    :: [{reference(), from()}]
          }).
 
 -include("locks.hrl").
@@ -143,6 +144,10 @@ record_fields(_) ->
 %% Public API (stable)
 %% ==================================================================
 
+-spec alive(election()) -> [pid()].
+alive(#st{synced = Synced, synced_workers = SyncedWs}) ->
+    Synced ++ SyncedWs.
+
 -spec candidates(election()) -> [pid()].
 candidates(#st{candidates = C}) -> C.
 
@@ -171,6 +176,17 @@ broadcast(Msg, #st{leader = L} = S) when L == self() ->
     _ = do_broadcast(S, Msg),
     ok;
 broadcast(_, _) ->
+    error(not_leader).
+
+broadcast(Msg, ToPids, #st{ leader = L
+                          , synced = Cands
+                          , synced_workers = Ws}) when L == self() ->
+    case (ToPids -- Cands) -- Ws of
+        [] -> ok;
+        Pids ->
+            _ = do_broadcast_(Pids, Msg)
+    end;
+broadcast(_, _, _) ->
     error(not_leader).
 
 -spec broadcast_to_candidates(any(), election()) -> ok.
@@ -247,15 +263,15 @@ leader_call(L, Request) ->
                          term().
 leader_call(L, Request, Timeout) ->
     case catch gen_statem:call(L, {'$locks_leader_call', Request}, Timeout) of
-	{'$locks_leader_reply',Res} = _R ->
-	    ?event({leader_call_return, L, Request, _R}),
-	    Res;
-	'$leader_died' = _R ->
-	    ?event({leader_call_return, L, Request, _R}),
-	    error({leader_died, {?MODULE, leader_call, [L, Request]}});
-	{'EXIT',Reason} = _R ->
-	    ?event({leader_call_return, L, Request, _R}),
-	    error({Reason, {?MODULE, leader_call, [L, Request]}})
+        {'$locks_leader_reply',Res} = _R ->
+            ?event({leader_call_return, L, Request, _R}),
+            Res;
+        '$leader_died' = _R ->
+            ?event({leader_call_return, L, Request, _R}),
+            error({leader_died, {?MODULE, leader_call, [L, Request]}});
+        {'EXIT',Reason} = _R ->
+            ?event({leader_call_return, L, Request, _R}),
+            error({Reason, {?MODULE, leader_call, [L, Request]}})
     end.
 
 leader_reply(From, Reply) ->
