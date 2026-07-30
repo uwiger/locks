@@ -277,6 +277,15 @@ wait_partition_leaders(Dicts) ->
                   end
           end, ?WAIT_TRIES).
 
+%% Wait until a lookup returns the expected value (full heal/election budget).
+wait_find(Key, Val, Dict) ->
+    retry(fun() ->
+                  case gdict:find(Key, Dict) of
+                      {ok, Val} = Ok -> Ok;
+                      Other -> error({badmatch, {find, Key, Other}})
+                  end
+          end, ?WAIT_TRIES).
+
 gdict_netsplit(Config) ->
     with_trace(fun gdict_netsplit_/1, Config, "leader_tests_netsplit").
 
@@ -303,20 +312,22 @@ gdict_netsplit_(Config) ->
     Results = proxy_multicall(Ns, gdict, new_opt, [[{resource, Name}]]),
     [Da,Db|[Dc|_] = DRest] = Dicts = lists:map(fun({ok,Dx}) -> Dx end, Results),
     locks_ttb:event({?LINE, dicts_created, lists:zip(Ns, Dicts)}),
-    ok = ?retry(ok, gdict:store(a, 1, Da)),
-    ok = gdict:store(b, 2, Dc),
-    {ok, 1} = ?retry({ok,1}, gdict:find(a, Db)),
-    error = gdict:find(a, Dc),
-    [X,X] = [locks_leader:info(Dx, leader) || Dx <- [Da,Db]],
-    locks_ttb:event({?LINE, leader_consensus, [Da,Db], X}),
-    RestLeaders = [locks_leader:info(Dx, leader) || Dx <- DRest],
+    %% Island A–B and island Rest elect independently. Do not snapshot leaders
+    %% once: on g_5 Rest is 3 nodes and a single info/2 poll can still see
+    %% undefined on a late follower (OTP 28 CI: [undefined, Pid]).
+    [X, X] = wait_same_leader([Da, Db]),
+    RestLeaders = wait_same_leader(DRest),
     [Y] = lists:usort(RestLeaders),
-    locks_ttb:event({?LINE, leader_consensus, DRest, Y}),
     true = (X =/= Y),
-    lists:foreach(
-      fun(Dx) ->
-              {ok, 2} = ?retry({ok,2}, gdict:find(b, Dx))
-      end, DRest),
+    locks_ttb:event({?LINE, leader_consensus, [Da, Db], X}),
+    locks_ttb:event({?LINE, leader_consensus, DRest, Y}),
+    ok = gdict:store(a, 1, Da),
+    ok = gdict:store(b, 2, Dc),
+    {ok, 1} = wait_find(a, 1, Db),
+    error = gdict:find(a, Dc),
+    [begin
+         {ok, 2} = wait_find(b, 2, Dx)
+     end || Dx <- DRest],
     error = gdict:find(b, Da),
     locks_ttb:event({?LINE, reconnecting}),
     proxy_multicall(Ns, ?MODULE, unbar_nodes, []),
@@ -325,8 +336,8 @@ gdict_netsplit_(Config) ->
     LeaderNodes = wait_same_leader_nodes(A, Dicts),
     [Z] = lists:usort(LeaderNodes),
     locks_ttb:event({?LINE, leader_consensus, Ns, Z}),
-    {ok, 1} = ?retry({ok,1}, gdict:find(a, Dc)),
-    {ok, 2} = ?retry({ok,2}, gdict:find(b, Da)),
+    {ok, 1} = wait_find(a, 1, Dc),
+    {ok, 2} = wait_find(b, 2, Da),
     [exit(Dx, kill) || Dx <- Dicts],
     proxy_multicall(Ns, application, stop, [locks]),
     ok.
