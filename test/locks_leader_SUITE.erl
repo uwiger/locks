@@ -579,18 +579,18 @@ with_trace(F, Config, Name) ->
             ttb_stop(),
             exit(R)
     end,
-    %% locks_ttb:stop_nofetch(),
-    locks_ttb:stop(),
+    ttb_stop(),
     ok.
 
 ttb_stop() ->
     Dir = locks_ttb:stop(),
     ct:log("Dir = ~p", [Dir]),
-    Out = filename:join(filename:dirname(Dir),
-                        filename:basename(Dir) ++ ".txt"),
-    ct:log("Out = ~p", [Out]),
-    locks_ttb:format(Dir, Out),
-    ct:log("Formatted trace log in ~s~n", [Out]).
+    Base = filename:join(filename:dirname(Dir), filename:basename(Dir)),
+    Out = Base ++ ".txt",
+    %% Compact event timeline for grepping; raw ttb dir remains for
+    %% locks_ttb:format/2 (full state) or ad-hoc ttb queries.
+    locks_ttb:format_events(Dir, Out),
+    ct:log("Event timeline in ~s (raw dir ~s)~n", [Out, Dir]).
 
 
 maybe_connect(_, []) ->
