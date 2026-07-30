@@ -787,11 +787,6 @@ paths() ->
     {Pas, Pzs}.
 
 
-host() ->
-    [_Name, Host] = re:split(atom_to_list(node()), "@", [{return, list}]),
-    list_to_atom(Host).
-
-
 patch_net_kernel() ->
     NetKernel = code:which(net_kernel),
     {ok, {_,[{abstract_code,

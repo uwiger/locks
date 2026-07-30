@@ -39,6 +39,13 @@ jobs:
       - name: Compile
         run: rebar3 compile
 
+      - name: Dialyzer
+        run: rebar3 dialyzer
+
+      - name: Dialyzer (test profile)
+        # Suites + gdict example apps; plt_extra_apps include ct/eunit/tools.
+        run: rebar3 as test dialyzer
+
       - name: EUnit
         run: rebar3 eunit
 

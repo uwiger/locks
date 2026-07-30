@@ -169,6 +169,8 @@ prepare_spawn(Options) ->
         false -> [{client, self()}|Options]
     end.
 
+%% Intentionally non-returning: loop/1 is the agent process main loop.
+-dialyzer({nowarn_function, agent_init/3}).
 agent_init(Wait, Client, Options) ->
     case init(Options) of
         {ok, St} ->
@@ -810,12 +812,14 @@ notify_have_all(#state{awaiting_all = Aw, status = Status} = S) ->
     [reply_await_(W, Status) || W <- Aw],
     S#state{awaiting_all = []}.
 
-%% reply_await_({Pid, notify}, Status) ->
-%%     notify_(Pid, Status);
-reply_await_({Pid, async}, Status) ->
+%% Waiters are either async notify clients or `{Pid, Tag}` pairs that expect
+%% `{Tag, Status}` (same shape as gen_server:reply/2). Tag may be a monitor
+%% ref from lock/wait or a gen_server reply_tag; avoid reconstructing an
+%% opaque reply_tag for dialyzer by sending the message directly.
+reply_await_({Pid, async}, Status) when is_pid(Pid) ->
     notify_(Pid, Status);
-reply_await_(From, Status) ->
-    gen_server:reply(From, Status).
+reply_await_({Pid, Tag}, Status) when is_pid(Pid) ->
+    Pid ! {Tag, Status}.
 
 abort_on_deadlock(OID, State) ->
     notify({abort, Reason = {deadlock, OID}}, State),

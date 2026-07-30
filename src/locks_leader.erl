@@ -74,7 +74,8 @@
 -type cb_return() ::
 	{ok, mod_state()}
       | {ok, msg(), mod_state()}
-      | {stop, reason, mod_state()}.
+      | {noreply, mod_state()}
+      | {stop, reason(), mod_state()}.
 -type cb_reply() ::
 	{reply, reply(), mod_state()}
       | {reply, reply(), msg(), mod_state()}
@@ -585,12 +586,14 @@ handle_common_info({nodedown, N}, State, #st{nodes = Nodes, leader = L} = Data) 
             keep_or_recheck(State, Data1)
     end;
 handle_common_info({'DOWN', _, _, _, _} = Msg, State, Data) ->
+    %% down/2 returns {#st{}, lost_leader} | #st{} | {stop, reason(), #st{}}
+    %% (the latter via apply_cb on untracked monitors / handle_info).
     case down(Msg, Data) of
         {Data1, lost_leader} ->
             Data2 = set_leader_uncertain(Data1),
             {next_state, candidate, Data2};
-        {Data1, _} ->
-            keep_or_recheck(State, Data1);
+        {stop, Reason, Data1} ->
+            {stop, Reason, Data1};
         Data1 when is_record(Data1, st) ->
             keep_or_recheck(State, Data1)
     end;

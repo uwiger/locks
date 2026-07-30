@@ -12,7 +12,9 @@
 -module(locks_ttb).
 
 -compile([export_all, nowarn_export_all]).
--dialyzer({nowarn_function, pp_term/1}).
+%% pp_term/io_lib_pretty paths are intentionally defensive over arbitrary
+%% terms; dialyzer cannot prove local return through pretty-print.
+-dialyzer({nowarn_function, [pp_term/1, pp/3, print/7]}).
 
 %% This function is also traced. Can be used to insert markers in the trace
 %% log. Leave calls in place as permanent instrumentation.
