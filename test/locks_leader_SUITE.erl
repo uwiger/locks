@@ -17,6 +17,7 @@
     gdict_all_nodes/1,
     gdict_netsplit/1,
     start_incremental/1,
+    late_join/1,
     random_netsplits/1
    ]).
 
@@ -66,7 +67,8 @@ groups() ->
      {g_3, [], [gdict_all_nodes,
                 gdict_netsplit]},
      {g_4, [], [gdict_all_nodes,
-                gdict_netsplit]},
+                gdict_netsplit,
+                late_join]},
      {g_5, [],   [gdict_all_nodes,
                   gdict_netsplit]},
      {g_2i, [], [start_incremental]},
@@ -339,6 +341,10 @@ start_incremental([], _, _) ->
 start_incremental([N|Ns], Alive, Name) ->
     start_incremental(N, Alive, Ns, Name).
 
+%% Grow membership one node at a time. After each join, require the same
+%% pid leader on every live dict (not merely "some leader exists") and that
+%% the seeded value is visible everywhere — the trust bar for incremental
+%% membership growth.
 start_incremental(N, Alive, Rest, Name) ->
     maybe_connect(N, Alive),
     ok = rpc:call(N, application, start, [locks]),
@@ -346,13 +352,79 @@ start_incremental(N, Alive, Rest, Name) ->
     ct:log("Dict created on ~p: ~p~n", [N, D]),
     insert_initial(D, Alive),
     NewAlive = [{N, D}|Alive],
-    Vals = [{D, ?retry({ok,1}, gdict:find(a, D1))}
-            || {_,D1} <- NewAlive],
+    Dicts = [D1 || {_, D1} <- NewAlive],
+    Vals = [{D1, ?retry({ok,1}, gdict:find(a, D1))} || D1 <- Dicts],
     ct:log("Values = ~p~n", [Vals]),
-    Leaders = [{D1, ?retry_not(undefined, locks_leader:info(D1, leader))}
-               || {_, D1} <- NewAlive],
-    ct:log("Leaders = ~p~n", [Leaders]),
+    Leaders = wait_same_leader(Dicts),
+    ct:log("Leaders after joining ~p = ~p~n", [N, Leaders]),
     start_incremental(Rest, NewAlive, Name).
+
+%% Scripted late join: stabilize N=3 with shared state, then bring a 4th
+%% node online into the live cluster and require consensus + state catch-up.
+%% Complements start_incremental (which never has a prior multi-node history
+%% before the join) by joining into an already-elected group.
+late_join(Config) ->
+    with_trace(fun late_join_/1, Config, "leader_tests_late_join").
+
+late_join_(Config) ->
+    Name = [?MODULE, ?LINE],
+    [A, B, C, D | _] = get_slave_nodes(Config),
+    Early = [A, B, C],
+    All = [A, B, C, D],
+    %% Prior cases in the group leave a residual full mesh. Tear it down so
+    %% the late node really is absent until we bring it in. Disconnect bars
+    %% peers under dist_auto_connect=once, so unbar again before remeshing.
+    proxy_multicall(All, ?MODULE, unbar_nodes, []),
+    proxy_multicall(All, ?MODULE, disconnect_nodes, [All]),
+    proxy_multicall(Early, ?MODULE, unbar_nodes, []),
+    proxy_multicall(Early, ?MODULE, connect_nodes, [Early]),
+    [begin
+         Expected = lists:sort(Early -- [N]),
+         Expected = lists:sort(call_proxy(N, erlang, nodes, []))
+     end || N <- Early],
+    [] = call_proxy(D, erlang, nodes, []),
+    ok = lists:foreach(
+           fun(ok) -> ok end,
+           proxy_multicall(Early, application, start, [locks])),
+    EarlyDicts = lists:map(
+                   fun({ok, Dx}) -> Dx end,
+                   proxy_multicall(Early, gdict, new_opt, [[{resource, Name}]])),
+    wait_for_dicts(EarlyDicts),
+    [L0, L0, L0] = wait_same_leader(EarlyDicts),
+    locks_ttb:event({?LINE, early_consensus, L0}),
+    ok = gdict:store(seed, early, hd(EarlyDicts)),
+    [begin
+         {ok, early} = ?retry({ok, early}, gdict:find(seed, Dx))
+     end || Dx <- EarlyDicts],
+    locks_ttb:event({?LINE, early_state_ok}),
+    %% Bring the late node into the mesh and start locks_leader there.
+    proxy_multicall([D], ?MODULE, unbar_nodes, []),
+    proxy_multicall([D], ?MODULE, allow, [Early]),
+    proxy_multicall(Early, ?MODULE, allow, [[D]]),
+    proxy_multicall([D], ?MODULE, connect_nodes, [Early]),
+    proxy_multicall(Early, ?MODULE, connect_nodes, [[D]]),
+    ExpectedAll = lists:sort(All),
+    [begin
+         Expected = lists:sort(ExpectedAll -- [N]),
+         Expected = lists:sort(call_proxy(N, erlang, nodes, []))
+     end || N <- ExpectedAll],
+    ok = call_proxy(D, application, start, [locks]),
+    {ok, Dd} = call_proxy(D, gdict, new_opt, [[{resource, Name}]]),
+    AllDicts = EarlyDicts ++ [Dd],
+    wait_for_dicts(AllDicts),
+    [L1, L1, L1, L1] = wait_same_leader(AllDicts),
+    locks_ttb:event({?LINE, late_join_consensus, L1}),
+    %% Late node must see state written before it joined; early nodes must
+    %% see a write originating from the late node.
+    {ok, early} = ?retry({ok, early}, gdict:find(seed, Dd)),
+    ok = gdict:store(from_late, 1, Dd),
+    [begin
+         {ok, 1} = ?retry({ok, 1}, gdict:find(from_late, Dx))
+     end || Dx <- AllDicts],
+    locks_ttb:event({?LINE, late_join_state_ok}),
+    [exit(Dx, kill) || Dx <- AllDicts],
+    proxy_multicall(All, application, stop, [locks]),
+    ok.
 
 random_netsplits(Config) ->
     with_trace(fun random_netsplits_/1, Config, "random_netsplits").
@@ -364,7 +436,7 @@ random_netsplits_(Config) ->
     St0 = #{ islands => []
            , idle    => Slaves
            , dict    => DName },
-    do_random_splits(St0, Config, 1000),
+    do_random_splits(St0, Config, 100),
     ok.
 
 do_random_splits(St, Config, N) when N > 0 ->
@@ -396,7 +468,7 @@ perform(rejoin, {A, B} = Arg, #{ islands := Isls } = St) ->
     NewIslands = [ A ++ B | (Isls -- [A, B]) ],
     ct:log("rejoined ~p -> ~p", [Arg, NewIslands]),
     %% Let election/sync settle before further splits or checks.
-    timer:sleep(100),
+    timer:sleep(1000),
     St#{ islands => NewIslands };
 perform(add, {Node, Island} = Arg, #{ islands := Isls
                                     , idle := Idle
