@@ -20,35 +20,52 @@ parse_transform(Forms, _) ->
 %% Variable names are fetched from the function head, so no pattern-matching
 %% in the head.
 locks_watcher(Agent) ->
-    case whereis(locks_server) of
-	undefined ->
+    Ws0 = [Agent],
+    case check_server(Ws0) of
+        false ->
 	    A = fun(A1) ->
 			try register(locks_watcher, self()),
 			     B = fun(B1,Ws) ->
 					 watcher(B1,Ws,Agent)
 				 end,
-			     B(B, [Agent])
+			     B(B, Ws0)
 			catch
 			    error:_ ->
 				another_watcher(A1, Agent)
 			end
 		end,
 	    A(A);
-	_Server ->
-	    Agent ! {locks_running, node()}
+        true ->
+            ok
+    end.
+
+check_server(Ws) ->
+    case whereis(locks_server) of
+        undefined ->
+            false;
+        _Server ->
+            [P ! {locks_running,node()} || P <- Ws],
+            true
     end.
 
 watcher(Cont,Ws,Agent) ->
-    receive
-	{From, watch_for_me, P} ->
-	    From ! {locks_watcher,ok},
-	    if node(P) == node(Agent) ->
-		    Cont(Cont,Ws);
-	       true ->
-		    Cont(Cont, [P|Ws])
-	    end;
-	locks_running ->
-	    [P ! {locks_running,node()} || P <- Ws]
+    %% Check whereis/1 again, to be absolutely sure (after we have registered)
+    case check_server(Ws) of
+        false ->
+            receive
+                {From, watch_for_me, P} ->
+                    From ! {locks_watcher,ok},
+                    if node(P) == node(Agent) ->
+                            Cont(Cont,Ws);
+                       true ->
+                            Cont(Cont, [P|Ws])
+                    end;
+                locks_running ->
+                    [P ! {locks_running,node()} || P <- Ws],
+                    ok
+            end;
+        true ->
+            ok
     end.
 
 another_watcher(Cont, Agent) ->
